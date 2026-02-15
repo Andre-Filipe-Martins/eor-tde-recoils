@@ -3,7 +3,8 @@
 ## Objective
 Model the contribution of recoiling massive black holes and their off-nuclear tidal disruption events (TDEs) to ionizing budgets during the Epoch of Reionization (z ~ 6–12).
 
-## Methods (high level)
+## My work
+I used available litterature to:
 - Monte Carlo population synthesis across redshift snapshots
 - Galaxy stellar mass function calibration and merger-rate prescriptions
 - Kick/escape dynamics in composite galaxy potentials
