@@ -4,6 +4,8 @@ Monte Carlo modelling for an MSc thesis project on recoiling massive black-hole 
 
 The project estimates whether TDEs produced by recoiling black-hole merger remnants can contribute significantly to the hydrogen-ionising energy budget required for cosmic reionisation. The calculation is deliberately optimistic: the recoil velocities are chosen from a ratio scan that maximises the number of external TDEs in each host-galaxy stellar-mass bin.
 
+A shorter skills-focused summary for recruiters and data-analysis roles is available in [`PORTFOLIO.md`](PORTFOLIO.md).
+
 ## Repository contents
 
 This repository contains the Python scripts used for the population synthesis, ratio scan, TDE counting, and ionising-energy comparison.
