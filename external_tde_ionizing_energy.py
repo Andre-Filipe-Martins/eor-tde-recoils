@@ -2,27 +2,24 @@
 """
 external_tde_ionizing_energy.py
 --------------------------------
-Compute the hydrogen-ionising energy budget (E > 13.6 eV) from external TDEs,
-defined as TDEs occurring outside the adopted central-region boundary across
-the EoR simulation runs, and plot per-host-mass-bin and total ionising energy
-histories vs. redshift.
+Compute the hydrogen-ionising energy budget from external TDEs in the revised
+major+minor galaxy-pair simulation.
 
-Because the simulation Parquets are cap-sampled per (z, mass bin), we first
-compute per-BH means within each (z, bin) from the capped catalogues, average
-those means over all Monte Carlo runs, and then multiply by the physical
-rounded targets from bin_targets_physical.parquet to recover physical totals.
-This post-processing stage reads existing simulation outputs and does not
-regenerate the Monte Carlo population.
+Every simulation row already carries its single physical cap-rescaling weight,
+weight = n_phys / n_samp.  This script therefore forms physical totals directly
+from sum(weight * quantity) in each run and then averages those physical totals
+over the independent Monte Carlo runs.  It never multiplies by the old target
+table a second time.
 
-Input
------
-  simulation_results/<run_tag>/data_z_*.parquet  — simulation snapshot Parquets
-  results_bin_targets/bin_targets_physical.parquet
-
-Output
+Inputs
 ------
-  external_tde_ionizing_energy.json    machine-readable summary (totals + fits)
-  external_tde_ionizing_energy.xlsx    formatted Excel workbook (totals + fits)
+  simulation_results/runXX/data_z_*.parquet
+
+Outputs
+-------
+  external_tde_ionizing_energy.json
+  external_tde_ionizing_energy_series.json
+  external_tde_ionizing_energy.xlsx
   figures/external_tde_ionizing_energy_per_bin.png
   figures/external_tde_ionizing_energy_total.png
 """
@@ -35,6 +32,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+import merger_pair_sampling as mps
 
 # Use a non-interactive backend so figures can be written on headless systems.
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -58,35 +57,40 @@ except NameError:
     BASE_DIR = os.getcwd()
 
 PARQUET_DIR = os.path.join(BASE_DIR, "simulation_results")
-TARGETS_DIR = os.path.join(BASE_DIR, "results_bin_targets")
-TARGETS_PQ  = os.path.join(TARGETS_DIR, "bin_targets_physical.parquet")
 FIG_DIR     = os.path.join(BASE_DIR, "figures")
 os.makedirs(FIG_DIR, exist_ok=True)
 
 SCRIPT_STEM  = os.path.splitext(os.path.basename(__file__))[0] if "__file__" in globals() \
                else "external_tde_ionizing_energy"
-JSON_OUTPATH = os.path.join(BASE_DIR, f"{SCRIPT_STEM}.json")
-XLSX_OUTPATH = os.path.join(BASE_DIR, f"{SCRIPT_STEM}.xlsx")
+JSON_OUTPATH        = os.path.join(BASE_DIR, f"{SCRIPT_STEM}.json")
+SERIES_JSON_OUTPATH = os.path.join(BASE_DIR, f"{SCRIPT_STEM}_series.json")
+XLSX_OUTPATH        = os.path.join(BASE_DIR, f"{SCRIPT_STEM}.xlsx")
 
 
 # ---------------------------------------------------------------------------
-# Host stellar-mass binning — must match the binning used in simulation.py
+# Shared descendant stellar-mass bins
 # ---------------------------------------------------------------------------
-LOGM_MIN, LOGM_MAX, BIN_WIDTH = 6.75, 9.90, 0.35
+EDGES = np.asarray(mps.DESCENDANT_LOGM_EDGES, dtype=float)
+ALL_LABELS = [mps.bin_label(EDGES[i], EDGES[i + 1])
+              for i in range(len(EDGES) - 1)]
+NBINS = len(ALL_LABELS)
+LOGM_MIN = float(EDGES[0])
+LOGM_MAX = float(EDGES[-1])
+BIN_WIDTH = float(EDGES[1] - EDGES[0])
 
-# If True, keep only rows with `t_external_yr > 0` when that column is
-# available. If the column is absent, the filter is skipped.
+# If True, keep only rows with t_external_yr > 0.  This does not normally
+# change the result because rows with no external interval already have zero
+# tde_external_post.
 REQUIRE_EXTERNAL_WINDOW = False
 
-# Verbosity flags
-PRINT_FILE_PATHS  = False
-PRINT_PER_Z_MEANS = False  # prints per-BH mean values per z (can be verbose)
-
+PRINT_FILE_PATHS = False
+PRINT_PER_Z_MEANS = False
 
 # ---------------------------------------------------------------------------
 # Physics knobs for ionising energy per TDE
 # ---------------------------------------------------------------------------
-M_STAR_TDE_MSUN = 1.0   # disrupted stellar mass [M_sun]
+M_STAR_TDE_MSUN = 1.3   # disrupted stellar mass [M_sun]
+R_STAR_TDE_RSUN = 1.3   # disrupted stellar radius [R_sun]
 F_DISK          = 0.5   # fraction of stellar debris that forms the accretion disc
 F_ION_PHASE     = 1.0   # fixed-energy path fraction going into ionising radiation
 ETA_FIXED       = 0.10  # fixed radiative efficiency (used when spin is unavailable)
@@ -120,25 +124,8 @@ YR_TO_S   = 365.25 * 24 * 3600.0
 
 
 # ---------------------------------------------------------------------------
-# Mass-bin helpers
+# Plot colours
 # ---------------------------------------------------------------------------
-def build_mass_bin_edges_and_labels(
-    lo: float = LOGM_MIN,
-    hi: float = LOGM_MAX,
-    width: float = BIN_WIDTH,
-) -> Tuple[np.ndarray, List[str]]:
-    """Return bin edges array and matching human-readable labels."""
-    n = int(np.floor((hi - lo) / width + 0.5))
-    edges = lo + width * np.arange(n + 1)
-    if edges[-1] < hi - 1e-9:
-        edges = np.append(edges, hi)
-    labels = [f"[{edges[i]:0.2f}, {edges[i+1]:0.2f}]" for i in range(len(edges) - 1)]
-    return edges, labels
-
-
-EDGES, ALL_LABELS = build_mass_bin_edges_and_labels()
-NBINS = len(ALL_LABELS)
-
 # Consistent plotting colour assigned to each host-mass bin.
 _default_colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
 COLOR_BY_LABEL  = {lbl: _default_colors[j % len(_default_colors)]
@@ -196,81 +183,12 @@ def discover_parquet_snapshots(
     if not paths_by_z:
         raise SystemExit("[ERROR] No Parquet snapshot files found in simulation_results/.")
 
+    for paths in paths_by_z.values():
+        paths.sort()
     z_array = np.array(sorted(paths_by_z.keys(), reverse=True), dtype=float)
     print("Parquet directory:", parquet_dir)
     print("Redshift snapshots found:", ", ".join(f"{z:.2f}" for z in z_array))
     return z_array, paths_by_z
-
-
-# ---------------------------------------------------------------------------
-# Physical bin targets loader
-# ---------------------------------------------------------------------------
-def _first_matching_column(df_columns, candidates: List[str]) -> Optional[str]:
-    """Return the first candidate column name that exists in df_columns."""
-    cols = set(df_columns)
-    for name in candidates:
-        if name in cols:
-            return name
-    return None
-
-
-def load_physical_targets(targets_pq: str) -> Dict[float, np.ndarray]:
-    """
-    Load bin_targets_physical.parquet and return a dict mapping each redshift
-    to a length-NBINS array of physical (rounded, pre-cap) merger-event counts per bin.
-    """
-    if not os.path.exists(targets_pq):
-        raise SystemExit(f"[ERROR] Missing targets Parquet: {targets_pq}")
-
-    tdf = pd.read_parquet(targets_pq)
-    if tdf is None or tdf.empty:
-        raise SystemExit(f"[ERROR] Targets Parquet is empty: {targets_pq}")
-
-    z_col  = _first_matching_column(tdf.columns, ["z", "z_cur", "z_current", "redshift"])
-    lo_col = _first_matching_column(tdf.columns, ["bin_lo_log10M", "logM_lo", "lo", "bin_lo", "m_lo"])
-    hi_col = _first_matching_column(tdf.columns, ["bin_hi_log10M", "logM_hi", "hi", "bin_hi", "m_hi"])
-    n_col  = _first_matching_column(tdf.columns, [
-        "n_phys", "N_phys",
-        "n_events_phys", "n_events_physical",
-        "n_events_rounded", "n_events_round",
-        "n_events", "N_events",
-        "target_phys", "target",
-        "mergers_rounded", "n_mergers_rounded",
-    ])
-
-    missing = [name for name, col in [("z", z_col), ("lo", lo_col), ("hi", hi_col), ("n", n_col)]
-               if col is None]
-    if missing:
-        raise SystemExit(
-            "[ERROR] Could not identify required columns in bin_targets_physical.parquet. "
-            f"Missing: {missing}. Columns present: {list(tdf.columns)}"
-        )
-
-    z_vals  = pd.to_numeric(tdf[z_col],  errors="coerce").to_numpy(float)
-    lo_vals = pd.to_numeric(tdf[lo_col], errors="coerce").to_numpy(float)
-    hi_vals = pd.to_numeric(tdf[hi_col], errors="coerce").to_numpy(float)
-    n_vals  = pd.to_numeric(tdf[n_col],  errors="coerce").to_numpy(float)
-
-    targets_by_z: Dict[float, np.ndarray] = {}
-    for z, lo, hi, n in zip(z_vals, lo_vals, hi_vals, n_vals):
-        if not all(np.isfinite(v) for v in (z, lo, hi, n)):
-            continue
-        z  = round(float(z),  2)
-        lo = round(float(lo), 2)
-        hi = round(float(hi), 2)
-
-        # Map (lo, hi) pair to a bin index
-        matches = np.where(np.isclose(EDGES[:-1], lo, atol=1e-6))[0]
-        if len(matches) == 0:
-            continue
-        i = int(matches[0])
-        if not (0 <= i < NBINS) or not np.isclose(EDGES[i + 1], hi, atol=1e-6):
-            continue
-
-        arr = targets_by_z.setdefault(z, np.zeros(NBINS, dtype=float))
-        arr[i] = float(n)
-
-    return targets_by_z
 
 
 # ---------------------------------------------------------------------------
@@ -286,8 +204,8 @@ def ionizing_energy_per_tde_erg(eta: float = ETA_FIXED) -> float:
 
 def _mummery_viscous_timescale_sec(v_nuis: float = MUM_V_NUIS) -> float:
     """Viscous timescale t_visc for the Mummery analytic disc model [seconds]."""
-    m_star = 1.0 * M_SUN
-    r_star = 1.0 * R_SUN
+    m_star = M_STAR_TDE_MSUN * M_SUN
+    r_star = R_STAR_TDE_RSUN * R_SUN
     t_star = np.sqrt(8.0 * r_star**3 / (G_GRAV * m_star))
     return float(v_nuis * t_star)
 
@@ -335,254 +253,374 @@ def mummery_accreted_mass_msun(
 
 
 # ---------------------------------------------------------------------------
-# Main aggregation
+# Main aggregation: direct physical row-weighted sums
 # ---------------------------------------------------------------------------
+CLASSES = (mps.MERGER_MAJOR, mps.MERGER_MINOR, "combined")
+
+
+def _descendant_bin_indices(mstar_msun: np.ndarray) -> np.ndarray:
+    """Assign rows to the shared descendant bins, including the final edge."""
+    mstar = np.asarray(mstar_msun, dtype=float)
+    logm = np.log10(mstar, where=(mstar > 0.0), out=np.full_like(mstar, np.nan))
+    idx = np.searchsorted(EDGES, logm, side="right") - 1
+    idx[np.isclose(logm, EDGES[-1], rtol=0.0, atol=1.0e-10)] = NBINS - 1
+    return idx.astype(np.int16, copy=False)
+
+
+def _read_weighted_columns(path: str) -> pd.DataFrame:
+    """Read only the columns needed for the weighted energy aggregation."""
+    columns = [
+        "population_model_version", "merger_class", "weight",
+        "Mstar_rem_Msun", "Mrem_BH_Msun", "tde_external_post",
+        "t_external_yr",
+    ]
+    if USE_SPIN_EFFICIENCY:
+        columns.append("a_spin")
+    try:
+        df = pd.read_parquet(path, columns=columns)
+    except Exception:
+        df = pd.read_parquet(path)
+
+    required = {
+        "population_model_version", "merger_class", "weight",
+        "Mstar_rem_Msun", "Mrem_BH_Msun", "tde_external_post",
+    }
+    missing = sorted(required.difference(df.columns))
+    if missing:
+        raise KeyError(
+            f"Incomplete revised simulation catalogue {path}: missing {missing}. "
+            "Rerun simulation.py with the matching updated files."
+        )
+
+    versions = set(df["population_model_version"].dropna().astype(str).unique())
+    if versions != {mps.MODEL_VERSION}:
+        raise RuntimeError(
+            f"Incompatible population model in {path}: found {sorted(versions)}, "
+            f"expected {mps.MODEL_VERSION!r}."
+        )
+    return df
+
+
 def accumulate_external_tdes_and_energy(
     z_array: np.ndarray,
     paths_by_z: Dict[float, List[str]],
-    targets_by_z: Dict[float, np.ndarray],
-) -> Tuple[np.ndarray, Dict, Dict, np.ndarray, np.ndarray]:
-    """
-    Read capped simulation catalogues for each redshift snapshot, compute
-    per-BH means per (z, bin, run), average those means over runs, and multiply
-    by physical targets to recover population totals.
+):
+    """Average direct physical weighted totals over runs at every redshift.
 
-    Returns (all arrays ordered by ascending redshift for plotting):
-      z_plot                  — sorted redshift array
-      series_ext_by_bin       — dict[bin_label] -> array of external TDE totals per z
-      eion_series_by_bin      — dict[bin_label] -> array of external ionizing energy [erg] per z
-      overall_ext             — total external TDEs summed over bins, per z
-      overall_eion            — total external ionizing energy [erg] summed over bins, per z
+    Returns
+    -------
+    z_plot, combined N/E series used by the figures, and a class_series mapping
+    containing combined, major, and minor physical totals.
     """
     n_z = len(z_array)
-    series_ext_by_bin  = {lbl: np.zeros(n_z, float) for lbl in ALL_LABELS}
-    eion_series_by_bin = {lbl: np.zeros(n_z, float) for lbl in ALL_LABELS}
-    overall_ext  = np.zeros(n_z, float)
-    overall_eion = np.zeros(n_z, float)
+    n_by_class = {cls: np.zeros((n_z, NBINS), dtype=float) for cls in CLASSES}
+    e_by_class = {cls: np.zeros((n_z, NBINS), dtype=float) for cls in CLASSES}
+    eion_fixed = ionizing_energy_per_tde_erg(ETA_FIXED)
 
-    eion_fixed             = ionizing_energy_per_tde_erg(ETA_FIXED)
-    warned_missing_targets = False
-
-    for i, z in enumerate(z_array):
-        paths  = paths_by_z[z]
-        n_runs = len(paths)
-        print(f"\n[z = {z:.2f}] Averaging over {n_runs} file(s)")
+    for iz, z in enumerate(z_array):
+        paths = paths_by_z[z]
+        print(f"\n[z = {z:.2f}] Direct weighted aggregation over {len(paths)} file(s)")
         if PRINT_FILE_PATHS:
-            for p in paths:
-                print("  ", p)
+            for path in paths:
+                print("  ", path)
 
-        n_phys = targets_by_z.get(z)
-        if n_phys is None:
-            if not warned_missing_targets:
-                print("  [warning] No entry for this z in bin_targets_physical.parquet; "
-                      "totals for missing snapshots will be zero.")
-                warned_missing_targets = True
-            n_phys = np.zeros(NBINS, dtype=float)
-
-        # Accumulate per-run BH means, then average over runs (bin-wise)
-        acc_mean_ext  = np.zeros(NBINS, float)
-        acc_mean_eion = np.zeros(NBINS, float)
-        acc_n_runs    = np.zeros(NBINS, float)
+        run_n = {cls: [] for cls in CLASSES}
+        run_e = {cls: [] for cls in CLASSES}
 
         for path in paths:
-            # Load only the columns we need; fall back to full read if columns
-            # are absent in some Parquet versions.
-            needed_cols = ["Mstar_rem_Msun", "Mrem_BH_Msun", "tde_external_post"]
-            optional_col = "t_external_yr"
-            try:
-                df = pd.read_parquet(path, columns=needed_cols + [optional_col])
-            except Exception:
-                try:
-                    df = pd.read_parquet(path, columns=needed_cols)
-                except Exception:
-                    try:
-                        df = pd.read_parquet(path)
-                    except Exception as exc:
-                        print(f"  [warning] Could not read {path}: {exc}")
-                        continue
-
+            df = _read_weighted_columns(path)
             if df is None or df.empty:
                 continue
 
-            # Optional filter: only keep BHs that had time to reach the external
-            # region before z = 6. The column may not exist in some Parquet versions.
-            if REQUIRE_EXTERNAL_WINDOW and (optional_col in df.columns):
-                t_avail = pd.to_numeric(df[optional_col], errors="coerce").fillna(0.0).to_numpy(float)
-                df = df.loc[t_avail > 0.0].copy()
+            if REQUIRE_EXTERNAL_WINDOW and "t_external_yr" in df.columns:
+                t_ext = pd.to_numeric(df["t_external_yr"], errors="coerce").fillna(0.0).to_numpy(float)
+                df = df.loc[t_ext > 0.0].copy()
                 if df.empty:
                     continue
 
-            # Assign each row to a stellar-mass bin
-            m_star = pd.to_numeric(df["Mstar_rem_Msun"], errors="coerce").to_numpy(float)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                log_mstar = np.log10(m_star)
+            mstar = pd.to_numeric(df["Mstar_rem_Msun"], errors="coerce").to_numpy(float)
+            mbh = pd.to_numeric(df["Mrem_BH_Msun"], errors="coerce").to_numpy(float)
+            n_ext = pd.to_numeric(df["tde_external_post"], errors="coerce").fillna(0.0).to_numpy(float)
+            weight = pd.to_numeric(df["weight"], errors="coerce").fillna(0.0).to_numpy(float)
+            merger_class = df["merger_class"].astype(str).str.lower().to_numpy()
+            bin_idx = _descendant_bin_indices(mstar)
 
-            bin_idx = np.searchsorted(EDGES, log_mstar, side="right") - 1
             valid = (
-                np.isfinite(log_mstar)
-                & (bin_idx >= 0)
-                & (bin_idx < NBINS)
-                & (log_mstar < EDGES[-1])
+                (bin_idx >= 0) & (bin_idx < NBINS)
+                & np.isfinite(mbh) & (mbh > 0.0)
+                & np.isfinite(weight) & (weight > 0.0)
+                & np.isin(merger_class, [mps.MERGER_MAJOR, mps.MERGER_MINOR])
             )
             if not np.any(valid):
                 continue
 
             bin_idx = bin_idx[valid].astype(int)
+            mbh = mbh[valid]
+            weight = weight[valid]
+            merger_class = merger_class[valid]
+            n_ext = np.where(np.isfinite(n_ext[valid]) & (n_ext[valid] > 0.0), n_ext[valid], 0.0)
 
-            # External TDE counts per row
-            n_ext = pd.to_numeric(df["tde_external_post"], errors="coerce").fillna(0.0).to_numpy(float)
-            n_ext = np.where(np.isfinite(n_ext) & (n_ext > 0.0), n_ext, 0.0)
-            n_ext = n_ext[valid]
-
-            # Radiative efficiency per row (spin-dependent or fixed)
-            if USE_SPIN_EFFICIENCY and ("a_spin" in df.columns):
-                a_spin = pd.to_numeric(df["a_spin"], errors="coerce").to_numpy(float)
-                a_spin = np.clip(a_spin, 0.0, 0.998)
-                eta = np.where(np.isfinite(a_spin), 0.057 + 0.3 * a_spin, ETA_FIXED)
-                eta = eta[valid]
+            if USE_SPIN_EFFICIENCY and "a_spin" in df.columns:
+                spin = pd.to_numeric(df["a_spin"], errors="coerce").to_numpy(float)[valid]
+                spin = np.clip(spin, 0.0, 0.998)
+                eta = np.where(np.isfinite(spin), 0.057 + 0.3 * spin, ETA_FIXED)
             else:
-                eta = np.full(int(np.count_nonzero(valid)), ETA_FIXED, dtype=float)
+                eta = np.full(len(mbh), ETA_FIXED, dtype=float)
 
-            # Ionizing energy per TDE: BH-mass-dependent or constant
             if USE_MUMMERY_MBH_DEPENDENCE:
-                mbh = pd.to_numeric(df["Mrem_BH_Msun"], errors="coerce").to_numpy(float)
-                mbh = np.where(np.isfinite(mbh) & (mbh > 0.0), mbh, np.nan)
-                mbh = mbh[valid]
-
                 m_disk = M_STAR_TDE_MSUN * F_DISK
                 delta_m_acc = mummery_accreted_mass_msun(mbh, m_disk)
-                eion_per_tde = eta * (delta_m_acc * M_SUN) * C_LIGHT**2 * 1e7
-                eion_per_tde = np.where(np.isfinite(eion_per_tde) & (eion_per_tde > 0.0),
-                                        eion_per_tde, 0.0)
+                eion_per_tde = eta * (delta_m_acc * M_SUN) * C_LIGHT**2 * 1.0e7
+                eion_per_tde = np.where(
+                    np.isfinite(eion_per_tde) & (eion_per_tde > 0.0),
+                    eion_per_tde,
+                    0.0,
+                )
             else:
-                eion_per_tde = np.full_like(eta, eion_fixed, dtype=float)
+                eion_per_tde = np.full(len(mbh), eion_fixed, dtype=float)
 
-            eion_row = n_ext * eion_per_tde
-            eion_row = np.where(np.isfinite(eion_row) & (eion_row > 0.0), eion_row, 0.0)
+            weighted_n = weight * n_ext
+            weighted_e = weighted_n * eion_per_tde
 
-            # Per-bin sums and counts for this run
-            cnt    = np.bincount(bin_idx, minlength=NBINS).astype(float)
-            s_ext  = np.bincount(bin_idx, weights=n_ext,    minlength=NBINS)
-            s_eion = np.bincount(bin_idx, weights=eion_row, minlength=NBINS)
+            per_run_n = {}
+            per_run_e = {}
+            for cls in (mps.MERGER_MAJOR, mps.MERGER_MINOR):
+                mask = merger_class == cls
+                per_run_n[cls] = np.bincount(
+                    bin_idx[mask], weights=weighted_n[mask], minlength=NBINS
+                ).astype(float)
+                per_run_e[cls] = np.bincount(
+                    bin_idx[mask], weights=weighted_e[mask], minlength=NBINS
+                ).astype(float)
+            per_run_n["combined"] = per_run_n[mps.MERGER_MAJOR] + per_run_n[mps.MERGER_MINOR]
+            per_run_e["combined"] = per_run_e[mps.MERGER_MAJOR] + per_run_e[mps.MERGER_MINOR]
 
-            # Per-run per-BH means (avoids bias from the cap-sampling)
-            mean_ext  = np.divide(s_ext,  cnt, out=np.zeros_like(s_ext),  where=cnt > 0)
-            mean_eion = np.divide(s_eion, cnt, out=np.zeros_like(s_eion), where=cnt > 0)
+            for cls in CLASSES:
+                run_n[cls].append(per_run_n[cls])
+                run_e[cls].append(per_run_e[cls])
 
-            has_data = cnt > 0
-            acc_mean_ext[has_data]  += mean_ext[has_data]
-            acc_mean_eion[has_data] += mean_eion[has_data]
-            acc_n_runs[has_data]    += 1.0
+        used_runs = len(run_n["combined"])
+        if used_runs == 0:
+            print("  [warning] no valid revised catalogues at this redshift")
+            continue
 
-        # Average the per-run means (bin-wise)
-        denom       = np.where(acc_n_runs > 0, acc_n_runs, 1.0)
-        mean_ext_z  = acc_mean_ext  / denom
-        mean_eion_z = acc_mean_eion / denom
+        for cls in CLASSES:
+            n_by_class[cls][iz] = np.mean(np.stack(run_n[cls], axis=0), axis=0)
+            e_by_class[cls][iz] = np.mean(np.stack(run_e[cls], axis=0), axis=0)
 
-        # Scale up to physical totals using the rounded targets
-        tot_ext_z  = mean_ext_z  * n_phys
-        tot_eion_z = mean_eion_z * n_phys
-
-        for b, lbl in enumerate(ALL_LABELS):
-            series_ext_by_bin[lbl][i]  = float(tot_ext_z[b])
-            eion_series_by_bin[lbl][i] = float(tot_eion_z[b])
-
-        overall_ext[i]  = float(np.sum(tot_ext_z))
-        overall_eion[i] = float(np.sum(tot_eion_z))
+        if not np.allclose(
+            n_by_class["combined"][iz],
+            n_by_class[mps.MERGER_MAJOR][iz] + n_by_class[mps.MERGER_MINOR][iz],
+            rtol=1.0e-10, atol=1.0e-6,
+        ):
+            raise RuntimeError(f"Major+minor TDE audit failed at z={z:.2f}")
+        if not np.allclose(
+            e_by_class["combined"][iz],
+            e_by_class[mps.MERGER_MAJOR][iz] + e_by_class[mps.MERGER_MINOR][iz],
+            rtol=1.0e-10, atol=1.0e40,
+        ):
+            raise RuntimeError(f"Major+minor energy audit failed at z={z:.2f}")
 
         if PRINT_PER_Z_MEANS:
-            print("  Per-BH means (averaged over runs):")
-            for b, lbl in enumerate(ALL_LABELS):
-                if n_phys[b] <= 0:
-                    continue
-                print(
-                    f"    {lbl}: <N_ext>={mean_ext_z[b]:.3e} per BH, "
-                    f"<E_ion,ext>={mean_eion_z[b]:.3e} erg per BH, "
-                    f"N_phys={n_phys[b]:.3e}"
-                )
+            print(
+                f"  mean physical totals: N_ext={n_by_class['combined'][iz].sum():.6e}, "
+                f"E_ion={e_by_class['combined'][iz].sum():.6e} erg"
+            )
 
-        # Sanity check: populated bins with no sampled remnants
-        problem_bins = np.where((n_phys > 0) & (acc_n_runs == 0))[0]
-        if len(problem_bins) > 0:
-            print("  [warning] Bins with N_phys > 0 but no sampled remnants in any run:")
-            for b in problem_bins:
-                print(f"    {ALL_LABELS[b]}: N_phys = {n_phys[b]:.3e}")
-
-    # Re-order arrays in ascending redshift for plotting
     order = np.argsort(z_array)
-    z_plot = z_array[order]
-    for lbl in ALL_LABELS:
-        series_ext_by_bin[lbl]  = series_ext_by_bin[lbl][order]
-        eion_series_by_bin[lbl] = eion_series_by_bin[lbl][order]
-    overall_ext  = overall_ext[order]
-    overall_eion = overall_eion[order]
+    z_plot = np.asarray(z_array, dtype=float)[order]
+    class_series = {}
+    for cls in CLASSES:
+        n_ordered = n_by_class[cls][order]
+        e_ordered = e_by_class[cls][order]
+        class_series[cls] = {
+            "N_ext_by_bin": {
+                label: n_ordered[:, ibin].copy() for ibin, label in enumerate(ALL_LABELS)
+            },
+            "E_ion_by_bin": {
+                label: e_ordered[:, ibin].copy() for ibin, label in enumerate(ALL_LABELS)
+            },
+            "overall_N_ext": np.sum(n_ordered, axis=1),
+            "overall_E_ion": np.sum(e_ordered, axis=1),
+        }
+
+    combined = class_series["combined"]
+    return (
+        z_plot,
+        combined["N_ext_by_bin"],
+        combined["E_ion_by_bin"],
+        combined["overall_N_ext"],
+        combined["overall_E_ion"],
+        class_series,
+    )
+
+
+# ---------------------------------------------------------------------------
+# JSON helper for cached redshift series
+# ---------------------------------------------------------------------------
+def _float_list(values) -> List[Optional[float]]:
+    """Return a JSON-safe list of floats, replacing NaN/inf with None."""
+    out: List[Optional[float]] = []
+    for value in np.asarray(values, dtype=float):
+        if np.isfinite(value):
+            out.append(float(value))
+        else:
+            out.append(None)
+    return out
+
+
+def write_redshift_series_json(
+    outpath: str,
+    z_plot: np.ndarray,
+    class_series: dict,
+) -> None:
+    """Save reusable per-redshift arrays for combined, major, and minor totals."""
+    payload = {
+        "meta": {
+            "script": SCRIPT_STEM,
+            "description": (
+                "Direct physical row-weighted totals, averaged over Monte Carlo runs. "
+                "No second multiplication by a target table is applied."
+            ),
+            "redshift_order": "ascending",
+            "population_model_version": mps.MODEL_VERSION,
+            "mass_bin_meaning": "descendant galaxy stellar mass",
+            "mass_bin_edges_log10M": _float_list(EDGES),
+            "M_star_TDE_Msun": M_STAR_TDE_MSUN,
+            "R_star_TDE_Rsun": R_STAR_TDE_RSUN,
+            "f_disk": F_DISK,
+            "eta_fixed": ETA_FIXED,
+            "use_mummery_mbh_dep": USE_MUMMERY_MBH_DEPENDENCE,
+            "use_spin_efficiency": USE_SPIN_EFFICIENCY,
+        },
+        "z": _float_list(z_plot),
+        "mass_bin_edges_log10M": _float_list(EDGES),
+        "mass_bin_labels": list(ALL_LABELS),
+        "classes": {},
+    }
+
+    for cls, data in class_series.items():
+        bins = []
+        for ibin, label in enumerate(ALL_LABELS):
+            n_values = np.asarray(data["N_ext_by_bin"][label], dtype=float)
+            e_values = np.asarray(data["E_ion_by_bin"][label], dtype=float)
+            bins.append({
+                "bin_label": label,
+                "bin_lo_log10M": float(EDGES[ibin]),
+                "bin_hi_log10M": float(EDGES[ibin + 1]),
+                "N_ext_TDE_by_z": _float_list(n_values),
+                "E_ion_ext_erg_by_z": _float_list(e_values),
+                "N_ext_TDE_total": float(np.nan_to_num(n_values).sum()),
+                "E_ion_ext_erg_total": float(np.nan_to_num(e_values).sum()),
+            })
+        payload["classes"][cls] = {
+            "bins": bins,
+            "total": {
+                "N_ext_TDE_by_z": _float_list(data["overall_N_ext"]),
+                "E_ion_ext_erg_by_z": _float_list(data["overall_E_ion"]),
+                "N_ext_TDE_total": float(np.nan_to_num(data["overall_N_ext"]).sum()),
+                "E_ion_ext_erg_total": float(np.nan_to_num(data["overall_E_ion"]).sum()),
+            },
+        }
+
+    # Backward-compatible aliases for plotting helpers that expect combined data.
+    payload["bins"] = payload["classes"]["combined"]["bins"]
+    payload["total"] = payload["classes"]["combined"]["total"]
+
+    with open(outpath, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    print(f"Saved redshift-series JSON: {outpath}")
+
+
+def load_redshift_series_json(path: str = SERIES_JSON_OUTPATH) -> dict:
+    """Load the cached per-redshift/per-bin series JSON."""
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def cached_series_to_arrays(payload: dict) -> Tuple[np.ndarray, Dict[str, np.ndarray], Dict[str, np.ndarray], np.ndarray, np.ndarray]:
+    """Convert a cached series-JSON payload back into NumPy arrays."""
+    z_plot = np.asarray(payload["z"], dtype=float)
+
+    series_ext_by_bin = {lbl: np.zeros_like(z_plot, dtype=float) for lbl in ALL_LABELS}
+    eion_series_by_bin = {lbl: np.zeros_like(z_plot, dtype=float) for lbl in ALL_LABELS}
+
+    for row in payload.get("bins", []):
+        lbl = row.get("bin_label")
+        if lbl not in series_ext_by_bin:
+            continue
+        series_ext_by_bin[lbl] = np.asarray(row.get("N_ext_TDE_by_z", []), dtype=float)
+        eion_series_by_bin[lbl] = np.asarray(row.get("E_ion_ext_erg_by_z", []), dtype=float)
+
+    total = payload.get("total", {})
+    overall_ext = np.asarray(total.get("N_ext_TDE_by_z", np.zeros_like(z_plot)), dtype=float)
+    overall_eion = np.asarray(total.get("E_ion_ext_erg_by_z", np.zeros_like(z_plot)), dtype=float)
 
     return z_plot, series_ext_by_bin, eion_series_by_bin, overall_ext, overall_eion
 
 
 # ---------------------------------------------------------------------------
-# Console summary
+# Console summary and output table
 # ---------------------------------------------------------------------------
-def print_external_energy_summary(series_ext_by_bin, eion_series_by_bin):
-    """Print a formatted per-bin table of total external TDEs and ionising energy."""
-    print("\n=== External TDE & ionizing-energy totals by host stellar-mass bin ===")
+def print_external_energy_summary(class_series: dict) -> None:
+    """Print combined totals and their major/minor decomposition by bin."""
+    print("\n=== External TDE and ionising-energy totals by descendant mass bin ===")
     header = (
-        f"{'Bin [log10 M*]':>18}  "
-        f"{'N_ext_TDE':>14}  "
-        f"{'E_ion,ext [erg]':>20}"
+        f"{'Bin [log10 M*]':>18}  {'N combined':>13}  {'N major':>13}  "
+        f"{'N minor':>13}  {'E combined [erg]':>18}"
     )
     print(header)
     print("-" * len(header))
-
-    total_tde  = 0.0
-    total_eion = 0.0
-    for i, lbl in enumerate(ALL_LABELS):
-        n_ext = float(np.nan_to_num(series_ext_by_bin[lbl], nan=0.0).sum())
-        e_ext = float(np.nan_to_num(eion_series_by_bin[lbl], nan=0.0).sum())
-        if n_ext <= 0.0 and e_ext <= 0.0:
+    for label in ALL_LABELS:
+        n_comb = float(np.nan_to_num(class_series['combined']['N_ext_by_bin'][label]).sum())
+        n_major = float(np.nan_to_num(class_series[mps.MERGER_MAJOR]['N_ext_by_bin'][label]).sum())
+        n_minor = float(np.nan_to_num(class_series[mps.MERGER_MINOR]['N_ext_by_bin'][label]).sum())
+        e_comb = float(np.nan_to_num(class_series['combined']['E_ion_by_bin'][label]).sum())
+        if n_comb <= 0.0 and e_comb <= 0.0:
             continue
-        print(
-            f"[{EDGES[i]:5.2f}, {EDGES[i+1]:5.2f}]  "
-            f"{n_ext:14.3e}  "
-            f"{e_ext:20.3e}"
-        )
-        total_tde  += n_ext
-        total_eion += e_ext
-
+        print(f"{label:>18}  {n_comb:13.3e}  {n_major:13.3e}  {n_minor:13.3e}  {e_comb:18.3e}")
     print("-" * len(header))
-    print(f"{'TOTAL (by-bin sum)':>18}  {total_tde:14.3e}  {total_eion:20.3e}")
+    for cls in ('combined', mps.MERGER_MAJOR, mps.MERGER_MINOR):
+        n_total = float(np.nan_to_num(class_series[cls]['overall_N_ext']).sum())
+        e_total = float(np.nan_to_num(class_series[cls]['overall_E_ion']).sum())
+        print(f"{cls.upper():>18}  {n_total:13.3e}  {'':13}  {'':13}  {e_total:18.3e}")
 
 
-# ---------------------------------------------------------------------------
-# Table builder for JSON / XLSX
-# ---------------------------------------------------------------------------
-def build_external_totals_table(series_ext_by_bin, eion_series_by_bin) -> pd.DataFrame:
-    """Return a DataFrame with per-bin external TDE counts and ionising energies."""
+def build_external_totals_table(class_series: dict) -> pd.DataFrame:
+    """Return per-bin and total combined/major/minor TDE and energy values."""
     rows = []
-    for i, lbl in enumerate(ALL_LABELS):
-        n_ext = float(np.nan_to_num(series_ext_by_bin[lbl], nan=0.0).sum())
-        e_ext = float(np.nan_to_num(eion_series_by_bin[lbl], nan=0.0).sum())
-        if n_ext <= 0.0 and e_ext <= 0.0:
-            continue
-        rows.append({
-            "section":        "external_totals",
-            "bin_label":      f"[{EDGES[i]:0.2f}, {EDGES[i+1]:0.2f}]",
-            "bin_lo_log10M":  float(EDGES[i]),
-            "bin_hi_log10M":  float(EDGES[i + 1]),
-            "N_ext_TDE":      n_ext,
-            "E_ion_ext_erg":  e_ext,
-        })
+    for ibin, label in enumerate(ALL_LABELS):
+        row = {
+            "section": "external_totals",
+            "bin_label": label,
+            "bin_lo_log10M": float(EDGES[ibin]),
+            "bin_hi_log10M": float(EDGES[ibin + 1]),
+        }
+        for cls, suffix in (("combined", ""), (mps.MERGER_MAJOR, "_major"),
+                            (mps.MERGER_MINOR, "_minor")):
+            row[f"N_ext_TDE{suffix}"] = float(
+                np.nan_to_num(class_series[cls]["N_ext_by_bin"][label]).sum()
+            )
+            row[f"E_ion_ext_erg{suffix}"] = float(
+                np.nan_to_num(class_series[cls]["E_ion_by_bin"][label]).sum()
+            )
+        rows.append(row)
 
-    total_tde  = sum(r["N_ext_TDE"]     for r in rows)
-    total_eion = sum(r["E_ion_ext_erg"] for r in rows)
-    rows.append({
-        "section":        "external_totals",
-        "bin_label":      "TOTAL (by-bin sum)",
-        "bin_lo_log10M":  float("nan"),
-        "bin_hi_log10M":  float("nan"),
-        "N_ext_TDE":      total_tde,
-        "E_ion_ext_erg":  total_eion,
-    })
+    total = {
+        "section": "external_totals",
+        "bin_label": "TOTAL (by-bin sum)",
+        "bin_lo_log10M": float("nan"),
+        "bin_hi_log10M": float("nan"),
+    }
+    for cls, suffix in (("combined", ""), (mps.MERGER_MAJOR, "_major"),
+                        (mps.MERGER_MINOR, "_minor")):
+        total[f"N_ext_TDE{suffix}"] = float(
+            np.nan_to_num(class_series[cls]["overall_N_ext"]).sum()
+        )
+        total[f"E_ion_ext_erg{suffix}"] = float(
+            np.nan_to_num(class_series[cls]["overall_E_ion"]).sum()
+        )
+    rows.append(total)
     return pd.DataFrame(rows)
 
 
@@ -723,8 +761,13 @@ def plot_external_ionizing_energy(
 
         ax.set_yscale("log")
         ax.set_ylim(y_min, y_max)
-        ax.set_title(f"Bin {lbl}")
+        ax.set_title(f"Bin {lbl}", fontsize=15)
+        ax.tick_params(axis="x", labelsize=12)
+        ax.tick_params(axis="y", labelsize=13)
         ax.grid(True, linestyle=":", linewidth=0.7)
+
+        if j % ncols == 0:
+            ax.set_ylabel(r"$E_{\rm ion,ext}$ [erg]", fontsize=14)
 
     for k in range(n_panels, len(axes)):
         axes[k].axis("off")
@@ -732,18 +775,22 @@ def plot_external_ionizing_energy(
     for ax in axes[:n_panels]:
         ax.set_xlim(z_plot.min() - 0.5 * bar_width, z_plot.max() + 0.5 * bar_width)
 
-    axes[0].set_ylabel(r"$E_{\rm ion,ext}$ [erg] per snapshot")
     for ax in axes[(nrows - 1) * ncols: nrows * ncols]:
         if ax.get_visible():
-            ax.set_xlabel("Redshift $z$")
+            ax.set_xlabel("Redshift $z$", fontsize=14)
 
     selection_note = " (filter: t_external_yr > 0)" if REQUIRE_EXTERNAL_WINDOW else ""
+
+    fig1.tight_layout(rect=[0, 0.02, 1, 0.90])
+
+    title_ax = axes[1] if n_panels > 1 else axes[0]
+    title_x = 0.5 * (title_ax.get_position().x0 + title_ax.get_position().x1)
+
     fig1.suptitle(
         "External TDE ionizing energy vs. redshift\n"
         f"Per host stellar-mass bin{selection_note}",
-        y=0.99, fontsize=12,
+        x=title_x, y=0.975, fontsize=18,
     )
-    fig1.tight_layout(rect=[0, 0.02, 1, 0.96])
 
     out1 = os.path.join(FIG_DIR, "external_tde_ionizing_energy_per_bin.png")
     save_figure(fig1, out1)
@@ -778,9 +825,11 @@ def plot_external_ionizing_energy(
     ax.set_yscale("log")
     ax.set_ylim(y_min, y_max)
     ax.set_xlim(z_plot.min() - 0.5 * bar_width, z_plot.max() + 0.5 * bar_width)
-    ax.set_title("Total external ionizing energy (all host-mass bins)")
-    ax.set_xlabel("Redshift $z$")
-    ax.set_ylabel(r"$E_{\rm ion,ext}$ [erg] per snapshot")
+    ax.set_title("Total external ionizing energy (all host-mass bins)", fontsize=16)
+    ax.set_xlabel("Redshift $z$", fontsize=14)
+    ax.set_ylabel(r"$E_{\rm ion,ext}$ [erg]", fontsize=14)
+    ax.tick_params(axis="x", labelsize=12)
+    ax.tick_params(axis="y", labelsize=13)
     ax.grid(True, linestyle=":", linewidth=0.7)
 
     fig2.tight_layout()
@@ -831,12 +880,16 @@ def write_tables_json(
         "meta": {
             "script":                  SCRIPT_STEM,
             "M_star_TDE_Msun":         M_STAR_TDE_MSUN,
+            "R_star_TDE_Rsun":         R_STAR_TDE_RSUN,
             "f_disk":                  F_DISK,
             "f_ion_phase":             F_ION_PHASE,
             "eta_fixed":               ETA_FIXED,
             "use_mummery_mbh_dep":     USE_MUMMERY_MBH_DEPENDENCE,
             "use_spin_efficiency":     USE_SPIN_EFFICIENCY,
             "require_external_window": REQUIRE_EXTERNAL_WINDOW,
+            "population_model_version": mps.MODEL_VERSION,
+            "weighting": "direct sum(weight * quantity), then mean over runs",
+            "mass_bin_meaning": "descendant galaxy stellar mass",
         },
         "external_totals": _df_to_records(totals_df) if totals_df is not None else [],
         "logpoly_fits":    _df_to_records(fits_df)   if fits_df   is not None else [],
@@ -904,8 +957,12 @@ def write_tables_xlsx(
             _format_sheet(wb["external_totals"], {
                 "bin_lo_log10M": "0.00",
                 "bin_hi_log10M": "0.00",
-                "N_ext_TDE":     "0.00E+00",
-                "E_ion_ext_erg": "0.00E+00",
+                "N_ext_TDE":             "0.00E+00",
+                "E_ion_ext_erg":         "0.00E+00",
+                "N_ext_TDE_major":       "0.00E+00",
+                "E_ion_ext_erg_major":   "0.00E+00",
+                "N_ext_TDE_minor":       "0.00E+00",
+                "E_ion_ext_erg_minor":   "0.00E+00",
             })
 
         if "logpoly_fits" in wb.sheetnames:
@@ -928,6 +985,7 @@ def main():
     eion_ref = ionizing_energy_per_tde_erg(ETA_FIXED)
     print("Per-TDE ionizing energy parameters:")
     print(f"  M_star_TDE     = {M_STAR_TDE_MSUN:.3f} M_sun")
+    print(f"  R_star_TDE     = {R_STAR_TDE_RSUN:.3f} R_sun")
     print(f"  f_disk         = {F_DISK:.3f}")
     print(f"  f_ion_phase    = {F_ION_PHASE:.3f}  (legacy fixed-DeltaM path only)")
     print(f"  eta_fixed      = {ETA_FIXED:.3f}")
@@ -951,20 +1009,24 @@ def main():
             print(f"  M_BH = {mbh_test:.1e} M_sun:  DeltaM_acc = {d_m:.3f} M_sun  ->  E_ion = {e:.3e} erg")
         print()
 
-    # Load data
+    # Load revised simulation catalogues and aggregate direct physical weights.
     z_array, paths_by_z = discover_parquet_snapshots(PARQUET_DIR)
-    targets_by_z        = load_physical_targets(TARGETS_PQ)
+    (
+        z_plot, series_ext_by_bin, eion_series_by_bin,
+        overall_ext, overall_eion, class_series,
+    ) = accumulate_external_tdes_and_energy(z_array, paths_by_z)
 
-    z_plot, series_ext_by_bin, eion_series_by_bin, overall_ext, overall_eion = (
-        accumulate_external_tdes_and_energy(z_array, paths_by_z, targets_by_z)
-    )
+    # Save the reusable arrays immediately after aggregation. This JSON is the
+    # lightweight cache used for later subset figures; no Parquet reads are
+    # needed once this file exists.
+    write_redshift_series_json(SERIES_JSON_OUTPATH, z_plot, class_series)
 
-    print_external_energy_summary(series_ext_by_bin, eion_series_by_bin)
+    print_external_energy_summary(class_series)
 
     total_tde  = float(np.nan_to_num(overall_ext,  nan=0.0).sum())
     total_eion = float(np.nan_to_num(overall_eion, nan=0.0).sum())
 
-    print("\n=== Global totals (external, mean over runs; physical targets applied) ===")
+    print("\n=== Global totals (external, direct weighted mean over runs) ===")
     print(f"  Total external TDEs          = {total_tde:.3e}")
     print(f"  Total external E_ion [erg]   = {total_eion:.3e}")
 
@@ -975,7 +1037,7 @@ def main():
     print()
 
     # Build output tables and write files
-    totals_df = build_external_totals_table(series_ext_by_bin, eion_series_by_bin)
+    totals_df = build_external_totals_table(class_series)
     fits_df   = plot_external_ionizing_energy(z_plot, eion_series_by_bin, overall_eion)
 
     write_tables_json(JSON_OUTPATH, totals_df, fits_df)
