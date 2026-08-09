@@ -18,13 +18,16 @@ This script is standalone and uses constants defined in the file.
 This script computes the requirement only; it does not use the simulated TDE
 catalogue.
 
-Output
-------
-  igm_reionization_requirement.xlsx   — formatted Excel workbook with all
-                                        thesis-reported quantities
+Outputs
+-------
+  igm_reionization_requirement.xlsx   — formatted Excel workbook
+  igm_reionization_requirement.json   — machine-readable values used by
+                                        gsmf_required_for_ftde_target.py
 """
 
+import json
 import math
+import os
 
 import numpy as np
 import pandas as pd
@@ -66,7 +69,13 @@ M_PROTON  = 1.67262192369e-27    # kg
 MPC_IN_M  = 3.08567758128e22     # m per Mpc
 EV_TO_ERG = 1.602176634e-12      # erg per eV
 
-XLSX_OUTPATH = "igm_reionization_requirement.xlsx"
+try:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    BASE_DIR = os.getcwd()
+
+XLSX_OUTPATH = os.path.join(BASE_DIR, "igm_reionization_requirement.xlsx")
+JSON_OUTPATH = os.path.join(BASE_DIR, "igm_reionization_requirement.json")
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +232,35 @@ def write_results_xlsx(outpath, results_df):
     print(f"Saved XLSX: {outpath}")
 
 
+
+
+# ---------------------------------------------------------------------------
+# JSON output
+# ---------------------------------------------------------------------------
+def write_results_json(outpath, values):
+    """Write machine-readable requirement values without changing the model."""
+    payload = {
+        "meta": {
+            "script": "igm_reionization_requirement",
+            "z_eor_start": Z_EOR_START,
+            "z_eor_end": Z_EOR_END,
+            "dz_shell": DZ_SHELL,
+            "full_sky_sr": FULL_SKY_SR,
+            "H0_km_s_Mpc": H0_KM_S_MPC,
+            "Omega_m": OMEGA_M,
+            "Omega_b": OMEGA_B,
+            "X_hydrogen": X_HYDROGEN,
+            "C_IGM": IGM_CLUMPING_FACTOR,
+            "T_IGM_K": IGM_TEMPERATURE_K,
+            "mean_photon_energy_eV": MEAN_PHOTON_ENERGY_EV,
+        },
+        "results": {key: float(value) for key, value in values.items()},
+    }
+    with open(outpath, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    print(f"Saved JSON: {outpath}")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -305,6 +343,16 @@ def main():
     })
 
     write_results_xlsx(XLSX_OUTPATH, results_df)
+    write_results_json(JSON_OUTPATH, {
+        "N_rec": N_rec,
+        "zeta_req_photons_per_H": zeta_req,
+        "n_H_atoms_per_Mpc3": N_H_per_Mpc3,
+        "n_gamma_req_photons_per_Mpc3": N_gamma_per_Mpc3,
+        "E_ion_req_erg_per_Mpc3": E_ion_per_Mpc3,
+        "V_EoR_Mpc3": V_EoR_Mpc3,
+        "N_gamma_req_EoR_total": N_gamma_EoR,
+        "E_ion_req_EoR_total_erg": E_ion_EoR,
+    })
 
 
 if __name__ == "__main__":
