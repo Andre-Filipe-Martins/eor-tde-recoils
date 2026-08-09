@@ -10,25 +10,38 @@ with Psi(r) = -Phi(r) the positive potential depth, normalised so Psi(0) = 0.5 *
 
 The scan is run for two values of F_CENT (1.00 and 0.05) back-to-back.
 
-Inputs
-------
+Input
+-----
   - ratio_scan_catalogue/runXX/data_z_*.parquet
-  - results_bin_targets/bin_targets_physical.parquet
+
+Each catalogue row already carries its physical cap-rescaling weight.  The
+scan therefore forms physical totals directly from weighted sums and never
+multiplies by a separate target table.
 
 Outputs (per F_CENT run):
   - XLSX table:  ratio_scan_vcent_tables__<fcent_tag>.xlsx
   - JSON table:  ratio_scan_vcent_rpeak__<fcent_tag>.json, including per-bin
     R_peak values used by the downstream final simulation
 
-Combined figure:
-  - external_tdes_vs_ratio_fcent_comparison.png
+Combined outputs:
+  - figures/external_tdes_vs_ratio_fcent_comparison.png
+  - ratio_scan_vcent_figure_data.json
 """
 
 import os
+
+# Keep each worker single-threaded. The expensive scan is parallelised across
+# snapshots below; allowing BLAS/OpenMP libraries to create extra threads in
+# every worker can otherwise oversubscribe the CPU and make the run slower.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS",      "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS",  "1")
+os.environ.setdefault("OMP_NUM_THREADS",      "1")
 import re
 import math
 import json
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import copy
 
 import numpy as np
@@ -39,6 +52,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import physics_relations as pr
+import merger_pair_sampling as mps
 
 
 # ===================== Optional openpyxl =====================
@@ -59,18 +73,16 @@ except NameError:
 
 PARQUET_ROOT = os.path.join(BASE_DIR, "ratio_scan_catalogue")
 
-TARGETS_DIR = os.path.join(BASE_DIR, "results_bin_targets")
-TARGETS_PQ  = os.path.join(TARGETS_DIR, "bin_targets_physical.parquet")
-
 FIG_DIR = os.path.join(BASE_DIR, "figures")
 os.makedirs(FIG_DIR, exist_ok=True)
 
 SCRIPT_STEM = "ratio_scan_vcent"
+FIGURE_DATA_JSON = os.path.join(BASE_DIR, f"{SCRIPT_STEM}_figure_data.json")
 
 
 # ===================== MASS BINS =====================
-MASS_EDGES_ALL  = np.array([6.75, 7.10, 7.45, 7.80, 8.15, 8.50, 8.85, 9.20, 9.55, 9.90])
-MASS_LABELS_ALL = [f"[{MASS_EDGES_ALL[i]:.2f}, {MASS_EDGES_ALL[i+1]:.2f}]"
+MASS_EDGES_ALL = np.asarray(mps.DESCENDANT_LOGM_EDGES, dtype=float)
+MASS_LABELS_ALL = [mps.bin_label(MASS_EDGES_ALL[i], MASS_EDGES_ALL[i + 1])
                    for i in range(len(MASS_EDGES_ALL) - 1)]
 N_MASS_ALL = len(MASS_LABELS_ALL)
 
@@ -92,8 +104,8 @@ TDECAY_MODE = "vkick"   # exponential decay timescale set by V_kick
 N_INT = 320             # integration resolution for representative-orbit travel times
 
 # Physical constants / unit conversions
-M_STAR_SI      = 1.0 * pr.M_sun
-R_SUN_M        = 6.957e8
+M_STAR_SI      = 1.3 * pr.M_sun
+R_STAR_SI      = 1.3 * 6.957e8
 SEC_PER_YEAR   = 365.25 * 24 * 3600
 KPC_TO_KM      = 3.085677581e16   # km per kpc
 
@@ -101,6 +113,13 @@ F_BULGE        = 0.1548           # bulge mass fraction (Model B)
 
 # Placeholder decay time for zero-kick events
 TDECAY_NO_DECAY_YR = 1e30
+
+# Number of independent redshift snapshots processed at the same time.
+# Two workers is deliberately conservative for RAM usage. Set the environment
+# variable RATIO_SCAN_WORKERS to 1 for serial execution or to a larger value
+# when sufficient memory is available.
+DEFAULT_WORKERS = 2
+N_WORKERS = max(1, int(os.environ.get("RATIO_SCAN_WORKERS", DEFAULT_WORKERS)))
 
 
 # ===================== PARQUET COLUMN DETECTION =====================
@@ -111,6 +130,8 @@ CAND = {
     "RE":    ["Re_kpc", "Reff_kpc", "R_e_kpc", "R_eff_kpc", "Re"],
     "VESC":  ["Vesc0_kms", "vesc0_kms", "Vesc_kms", "vesc_kms", "Vesc0"],
     "W":     ["weight", "w", "count", "N_weight", "N", "N_galaxies", "N_targets"],
+    "CLASS": ["merger_class"],
+    "VERSION": ["population_model_version"],
 }
 
 try:
@@ -174,54 +195,6 @@ def discover_parquet_snapshots(parquet_root: str):
 
     Zs = sorted(paths_by_z.keys(), reverse=True)
     return Zs, paths_by_z
-
-
-# ===================== PHYSICAL BIN TARGETS =====================
-def _bin_key(z, lo, hi):
-    """Hashable key for a (z, bin_lo, bin_hi) entry."""
-    return (f"{float(z):.2f}", f"{float(lo):.2f}", f"{float(hi):.2f}")
-
-
-def load_bin_targets_physical():
-    """
-    Load the rounded, pre-cap physical merger-event counts per (z, bin_lo, bin_hi).
-    Expected columns: z, bin_lo_log10M, bin_hi_log10M, n_events_phys.
-    Written by ratio_scan_sample_gen.py.
-    """
-    if not os.path.exists(TARGETS_PQ):
-        raise FileNotFoundError(
-            f"Physical targets file not found: {TARGETS_PQ}\n"
-            "Run ratio_scan_sample_gen.py first to generate it."
-        )
-    return pd.read_parquet(TARGETS_PQ)
-
-
-def build_phys_target_map(df_targets):
-    """
-    Convert the targets DataFrame into a dict keyed by _bin_key(z, lo, hi)
-    returning the integer physical event count for each bin.
-    """
-    needed = {"z", "bin_lo_log10M", "bin_hi_log10M", "n_events_phys"}
-    missing = [c for c in needed if c not in df_targets.columns]
-    if missing:
-        raise KeyError(f"[targets] Missing columns in targets file: {missing}")
-
-    phys_count_map = {}
-    for row in df_targets.itertuples(index=False):
-        z  = getattr(row, "z")
-        lo = getattr(row, "bin_lo_log10M")
-        hi = getattr(row, "bin_hi_log10M")
-        n  = getattr(row, "n_events_phys")
-        if not np.isfinite(z) or not np.isfinite(lo) or not np.isfinite(hi):
-            continue
-        try:
-            n_int = int(n)
-        except Exception:
-            continue
-        if n_int <= 0:
-            continue
-        phys_count_map[_bin_key(z, lo, hi)] = n_int
-    return phys_count_map
 
 
 # ===================== GRAVITATIONAL POTENTIAL =====================
@@ -340,7 +313,11 @@ def build_rep_times_for_snapshot(df, z, F_CENT):
     Vesc0 = pd.to_numeric(df["_VESC"],  errors="coerce").to_numpy(float)
 
     logM   = np.log10(Mstar, where=(Mstar > 0), out=np.full_like(Mstar, np.nan))
-    mass_i = np.digitize(logM, MASS_EDGES_ALL) - 1
+    mass_i = np.digitize(logM, MASS_EDGES_ALL, right=False) - 1
+    # np.digitize places an exact final-edge value one bin beyond the array.
+    # Keep that boundary in the last descendant bin instead of dropping it.
+    on_final_edge = np.isclose(logM, MASS_EDGES_ALL[-1], rtol=0.0, atol=1e-10)
+    mass_i[on_final_edge] = N_MASS_ALL - 1
 
     for m in range(N_MASS_ALL):
         sel = (
@@ -376,7 +353,7 @@ def build_rep_times_for_snapshot(df, z, F_CENT):
             rc_eff     = rc * Vcent_over_Vesc0
             psi_target = psi0 * (1.0 - rc_eff ** 2)
 
-            psi_Rc = float(psi(R_cent))
+            psi_Rc = psi_Rc0
             if not np.isfinite(psi_Rc) or psi_Rc <= psi_target:
                 continue
 
@@ -480,406 +457,641 @@ def fcent_tag(fcent: float) -> str:
     return f"fcent{fcent:.2f}".replace(".", "p")
 
 
-def write_peak_json(outpath, meta, peaks_rows, rpeak_by_bin, overall_best):
-    """Save peak-ratio results to a JSON file consumed by downstream scripts."""
+def write_peak_json(
+    outpath,
+    meta,
+    peaks_rows,
+    rpeak_by_bin,
+    overall_best,
+    rpeak_by_class,
+    grids_by_class,
+):
+    """Save combined production peaks and class-specific diagnostics."""
     payload = {
-        "meta":         meta,
+        "meta": meta,
+        # Downstream simulation.py consumes the combined population peaks.
         "R_peak_by_bin": rpeak_by_bin,
-        "bins":         peaks_rows,
-        "overall_max":  overall_best,
+        "R_peak_by_bin_by_class": rpeak_by_class,
+        "bins": peaks_rows,
+        "overall_max": overall_best,
+        "external_tde_grid_by_class": {
+            cls: _json_safe_value(arr) for cls, arr in grids_by_class.items()
+        },
     }
     with open(outpath, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     print(f"Saved peak table JSON: {outpath}")
 
 
-def write_tables_xlsx(outpath, peaks_df, grid_df):
+def _json_safe_value(x):
     """
-    Write peak-ratio summary and the full external TDE grid to an Excel file.
-    Applies number formatting and auto-widths if openpyxl is available.
+    Convert NumPy/Python values into JSON-safe values.
+    Non-finite floating-point values are written as None.
     """
+    if isinstance(x, np.ndarray):
+        return [_json_safe_value(v) for v in x.tolist()]
+
+    if isinstance(x, (list, tuple)):
+        return [_json_safe_value(v) for v in x]
+
+    if isinstance(x, dict):
+        return {str(k): _json_safe_value(v) for k, v in x.items()}
+
+    if isinstance(x, (np.integer,)):
+        return int(x)
+
+    if isinstance(x, (np.floating, float)):
+        x = float(x)
+        return x if np.isfinite(x) else None
+
+    return x
+
+
+def write_figure_data_json(outpath, results):
+    """Cache combined and class-specific ratio-scan curves for later plotting."""
+    payload = {
+        "meta": {
+            "script": SCRIPT_STEM,
+            "figure": "figures/external_tdes_vs_ratio_fcent_comparison.png",
+            "description": (
+                "Physical external TDE totals from direct row-weighted sums. "
+                "The main figure uses the combined major+minor population."
+            ),
+            "ratio_definition": "R = V_kick / V_cent",
+            "RATIO_MIN": float(RATIO_MIN),
+            "RATIO_MAX": float(RATIO_MAX),
+            "DR": float(DR),
+            "N_R": int(N_R),
+            "TDECAY_MODE": str(TDECAY_MODE),
+            "F_BULGE": float(F_BULGE),
+            "N_INT": int(N_INT),
+        },
+        "ratio_edges": _json_safe_value(RATIO_EDGES),
+        "ratio_centers": _json_safe_value(RATIO_CENTERS),
+        "mass_edges_log10Mstar": _json_safe_value(MASS_EDGES_ALL),
+        "mass_labels": list(MASS_LABELS_ALL),
+        "fcent_order": [],
+        "series": {},
+    }
+
+    for fcent, totals_by_class in results:
+        key = fcent_tag(float(fcent))
+        payload["fcent_order"].append(key)
+        payload["series"][key] = {"F_CENT": float(fcent), "classes": {}}
+        for cls, values in totals_by_class.items():
+            arr = np.asarray(values, dtype=float)
+            if arr.shape != (N_MASS_ALL, N_R):
+                raise ValueError(
+                    f"Unexpected ratio grid for {key}/{cls}: {arr.shape}; "
+                    f"expected {(N_MASS_ALL, N_R)}"
+                )
+            payload["series"][key]["classes"][cls] = {
+                "N_TDE_external_by_bin": {
+                    MASS_LABELS_ALL[m]: _json_safe_value(arr[m, :])
+                    for m in range(N_MASS_ALL)
+                }
+            }
+
+    with open(outpath, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    print(f"Saved figure-data JSON: {outpath}")
+
+
+def write_tables_xlsx(outpath, peaks_df, grid_dfs):
+    """Write peak summaries and combined/major/minor ratio grids."""
     if not _HAS_OPENPYXL:
         print(f"[warning] openpyxl not available; skipping XLSX output: {outpath}")
-        print(f"          openpyxl import error: {_OPENPYXL_ERR}")
-        return
-
-    if (peaks_df is None or peaks_df.empty) and (grid_df is None or grid_df.empty):
-        print(f"[warning] No tables to write to XLSX: {outpath}")
         return
 
     def _format_sheet(ws, numfmt_by_colname, freeze_cell="A2"):
         ws.freeze_panes = freeze_cell
         ws.auto_filter.ref = ws.dimensions
-
         for cell in ws[1]:
-            f = copy(cell.font)
-            f.bold = True
-            cell.font = f
-            a = copy(cell.alignment)
-            a.horizontal = "center"
-            cell.alignment = a
-
-        header     = [c.value for c in ws[1]]
+            f = copy(cell.font); f.bold = True; cell.font = f
+            a = copy(cell.alignment); a.horizontal = "center"; cell.alignment = a
+        header = [c.value for c in ws[1]]
         name_to_col = {name: j + 1 for j, name in enumerate(header) if name is not None}
-
         for colname, fmt in numfmt_by_colname.items():
             if colname not in name_to_col:
                 continue
             cidx = name_to_col[colname]
             for r in range(2, ws.max_row + 1):
                 ws.cell(row=r, column=cidx).number_format = fmt
-
         for j in range(1, ws.max_column + 1):
             col_letter = get_column_letter(j)
-            max_len    = 0
-            for r in range(1, ws.max_row + 1):
-                v = ws.cell(row=r, column=j).value
-                if v is not None:
-                    max_len = max(max_len, len(str(v)))
+            max_len = max(
+                (len(str(ws.cell(row=r, column=j).value or ""))
+                 for r in range(1, ws.max_row + 1)),
+                default=0,
+            )
             ws.column_dimensions[col_letter].width = min(max_len + 2, 55)
 
     def _write(path):
         with pd.ExcelWriter(path, engine="openpyxl") as writer:
             if peaks_df is not None and not peaks_df.empty:
                 peaks_df.to_excel(writer, sheet_name="peaks", index=False)
-            if grid_df is not None and not grid_df.empty:
-                grid_df.to_excel(writer, sheet_name="ext_tot_grid", index=False)
+            for cls, grid_df in grid_dfs.items():
+                if grid_df is not None and not grid_df.empty:
+                    grid_df.to_excel(writer, sheet_name=f"grid_{cls}"[:31], index=False)
 
             wb = writer.book
-
             if "peaks" in wb.sheetnames:
                 _format_sheet(wb["peaks"], {
-                    "bin_lo_log10M":       "0.00",
-                    "bin_hi_log10M":       "0.00",
-                    "R_peak":              "0.000",
-                    "peak_total_ext_tdes": "0.00E+00",
-                }, freeze_cell="A2")
-
-            if "ext_tot_grid" in wb.sheetnames:
+                    "bin_lo_log10M": "0.000",
+                    "bin_hi_log10M": "0.000",
+                    "R_peak_combined": "0.000",
+                    "peak_total_combined": "0.00E+00",
+                    "R_peak_major": "0.000",
+                    "R_peak_minor": "0.000",
+                    "major_at_combined_peak": "0.00E+00",
+                    "minor_at_combined_peak": "0.00E+00",
+                })
+            for sheet in [name for name in wb.sheetnames if name.startswith("grid_")]:
                 fmts = {"R_center": "0.00"}
-                for lab in MASS_LABELS_ALL:
-                    fmts[lab] = "0.00E+00"
-                _format_sheet(wb["ext_tot_grid"], fmts, freeze_cell="A2")
-
+                fmts.update({lab: "0.00E+00" for lab in MASS_LABELS_ALL})
+                _format_sheet(wb[sheet], fmts)
         print(f"Saved XLSX tables: {path}")
 
     try:
         _write(outpath)
     except PermissionError:
-        ts   = time.strftime("%Y%m%d_%H%M%S")
+        ts = time.strftime("%Y%m%d_%H%M%S")
         root, ext = os.path.splitext(outpath)
-        alt  = f"{root}_{ts}{ext}"
+        alt = f"{root}_{ts}{ext}"
         print(f"[warning] XLSX appears open/locked. Writing to: {alt}")
         _write(alt)
 
 
 # ===================== SCAN FOR ONE F_CENT VALUE =====================
-def run_one_fcent(F_CENT, Zs, paths_by_z, phys_map, n_runs_nominal):
-    """
-    Execute the full V_kick/V_cent ratio scan for one central-boundary choice F_CENT.
-    Saves XLSX and JSON tables and returns the physical external-TDE total grid
-    with shape (N_MASS_ALL, N_R).
-    """
-    tag_fcent = fcent_tag(F_CENT)
+# ===================== FAST SNAPSHOT SCAN =====================
+def _read_and_normalise_catalogue(path):
+    """Read the required catalogue columns and map them to canonical names."""
+    if HAVE_PYARROW:
+        schema_cols = set(pq.ParquetFile(path).schema.names)
+        cols_to_read = [c for c in NEEDED_CAND_COLS if c in schema_cols]
+        df = pd.read_parquet(path, columns=cols_to_read) if cols_to_read else pd.read_parquet(path)
+    else:
+        df = pd.read_parquet(path)
 
+    if df is None or df.empty:
+        return None
+
+    c_mstar = first_col(df, CAND["MSTAR"])
+    c_mbh = first_col(df, CAND["MBH"])
+    c_re = first_col(df, CAND["RE"])
+    c_vesc = first_col(df, CAND["VESC"])
+    c_w = first_col(df, CAND["W"])
+    c_class = first_col(df, CAND["CLASS"])
+    c_version = first_col(df, CAND["VERSION"])
+    required_cols = [c_mstar, c_mbh, c_re, c_vesc, c_w, c_class, c_version]
+    if any(col is None for col in required_cols):
+        raise KeyError(
+            "The ratio-scan catalogues must contain descendant mass, remnant BH mass, "
+            "Re, Vesc0, weight, merger_class and population_model_version columns. "
+            "Rerun ratio_scan_sample_gen.py with the matching updated files."
+        )
+
+    versions = set(df[c_version].dropna().astype(str).unique())
+    if versions != {mps.MODEL_VERSION}:
+        raise RuntimeError(
+            f"Incompatible catalogue model version in {os.path.basename(path)}: "
+            f"found {sorted(versions)}, expected {mps.MODEL_VERSION!r}. "
+            "Rerun ratio_scan_sample_gen.py before the ratio scan."
+        )
+
+    return df.rename(columns={
+        c_mstar: "_MSTAR", c_mbh: "_MBH", c_re: "_RE",
+        c_vesc: "_VESC", c_w: "_W", c_class: "_CLASS",
+        c_version: "_MODEL_VERSION",
+    })
+
+
+def _representative_bins_in_catalogue(df):
+    """Return descendant bins present in a catalogue for representative orbits."""
+    mstar = pd.to_numeric(df["_MSTAR"], errors="coerce").to_numpy(float)
+    logm = np.log10(
+        mstar,
+        where=(mstar > 0),
+        out=np.full(len(df), np.nan, dtype=float),
+    )
+    bins = np.searchsorted(MASS_EDGES_ALL, logm, side="right") - 1
+    bins[np.isclose(logm, MASS_EDGES_ALL[-1], rtol=0.0, atol=1e-10)] = N_MASS_ALL - 1
+    present = bins[(bins >= 0) & (bins < N_MASS_ALL)]
+    return np.unique(present)
+
+
+def _prepare_run_arrays(df):
+    """Validate rows and precompute all quantities independent of F_CENT and R."""
+    Mstar = pd.to_numeric(df["_MSTAR"], errors="coerce").to_numpy(float)
+    Mbh = pd.to_numeric(df["_MBH"], errors="coerce").to_numpy(float)
+    Re = pd.to_numeric(df["_RE"], errors="coerce").to_numpy(float)
+    Vesc0 = pd.to_numeric(df["_VESC"], errors="coerce").to_numpy(float)
+    W = pd.to_numeric(df["_W"], errors="coerce").to_numpy(float)
+    merger_class = df["_CLASS"].astype(str).str.lower().to_numpy()
+
+    logM = np.log10(Mstar, where=(Mstar > 0), out=np.full_like(Mstar, np.nan))
+    mass_i = np.searchsorted(MASS_EDGES_ALL, logM, side="right") - 1
+    mass_i[np.isclose(logM, MASS_EDGES_ALL[-1], rtol=0.0, atol=1e-10)] = N_MASS_ALL - 1
+
+    valid = (
+        (mass_i >= 0) & (mass_i < N_MASS_ALL) &
+        np.isfinite(Mbh) & (Mbh > 0) &
+        np.isfinite(Re) & (Re > 0) &
+        np.isfinite(Vesc0) & (Vesc0 > 0) &
+        np.isfinite(W) & (W > 0) &
+        np.isin(merger_class, ["major", "minor"])
+    )
+    if not np.any(valid):
+        return None
+
+    mass_i = mass_i[valid].astype(int)
+    Mbh = Mbh[valid]
+    Re = Re[valid]
+    Vesc0 = Vesc0[valid]
+    W = W[valid]
+    merger_class = merger_class[valid]
+
+    Mbh_SI = Mbh * pr.M_sun
+    sigma_km_s, _ = pr.sigma_from_mbh(Mbh_SI)
+    rt = pr.r_t(Mbh_SI, M_STAR_SI, R_STAR_SI)
+
+    # These factors were previously recomputed for every one of the 90 ratio
+    # values, although they depend only on the remnant catalogue row.
+    mb_coll_prefactor_msun = (
+        4.0e4
+        * (Mbh / 1.0e7) ** (-0.25)
+        * (sigma_km_s / 100.0) ** 2.5
+    )
+    ln_lambda = np.log(Mbh_SI / M_STAR_SI)
+    t_decay_mass_prefactor_yr = 1.5e9 * (Mbh / 1.0e7) ** 2
+
+    return {
+        "mass_i": mass_i,
+        "Mbh": Mbh,
+        "Mbh_SI": Mbh_SI,
+        "Re": Re,
+        "Vesc0": Vesc0,
+        "W": W,
+        "major_mask": merger_class == "major",
+        "minor_mask": merger_class == "minor",
+        "sigma_km_s": sigma_km_s,
+        "rt": rt,
+        "mb_coll_prefactor_msun": mb_coll_prefactor_msun,
+        "ln_lambda": ln_lambda,
+        "t_decay_mass_prefactor_yr": t_decay_mass_prefactor_yr,
+        "re_over_vesc": Re / Vesc0,
+    }
+
+
+def _scan_prepared_run(prep, dt_to_z6_yr, rep_data):
+    """Scan one prepared run for one F_CENT value.
+
+    The physical equations are unchanged. Work that is independent of the
+    ratio is cached, rows that do not cross the boundary before z=6 are skipped,
+    and the two exponential integrals reuse the same decay exponentials.
+    """
+    rep_t_leave, rep_t_ext_max, rep_scale_base, rep_Vcent_over_Vesc0 = rep_data
+
+    mass_i = prep["mass_i"]
+    missing_rep_bins = np.unique(mass_i[~np.isfinite(rep_scale_base[mass_i])])
+    if len(missing_rep_bins):
+        missing_labels = [MASS_LABELS_ALL[int(b)] for b in missing_rep_bins]
+        raise RuntimeError(
+            f"No valid representative descendant potential for bins {missing_labels}."
+        )
+
+    base = rep_scale_base[mass_i]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        scale = prep["re_over_vesc"] / base
+    scale = np.where(np.isfinite(scale) & (scale > 0), scale, 1.0)
+
+    vcent_ratio = rep_Vcent_over_Vesc0[mass_i]
+    vcent_ratio = np.where(
+        np.isfinite(vcent_ratio) & (vcent_ratio > 0), vcent_ratio, 1.0
+    )
+    t_cap = np.full_like(prep["Mbh"], dt_to_z6_yr, dtype=float)
+
+    ext_run = {
+        "major": np.zeros((N_MASS_ALL, N_R), float),
+        "minor": np.zeros((N_MASS_ALL, N_R), float),
+        "combined": np.zeros((N_MASS_ALL, N_R), float),
+    }
+
+    for rbin, rc in enumerate(RATIO_CENTERS):
+        # Boundary crossing depends only on representative orbit times and the
+        # exact Re/Vesc scaling. Rows that do not leave have exactly zero
+        # external TDEs, so the expensive TDE calculation is unnecessary.
+        t_leave_all = rep_t_leave[mass_i, rbin] * scale
+        t_leave_all = np.where(
+            np.isfinite(t_leave_all) & (t_leave_all > 0), t_leave_all, np.nan
+        )
+        active = np.isfinite(t_leave_all) & (t_leave_all < t_cap)
+        if not np.any(active):
+            continue
+
+        mi = mass_i[active]
+        Mbh = prep["Mbh"][active]
+        Mbh_SI = prep["Mbh_SI"][active]
+        Vesc0 = prep["Vesc0"][active]
+        W = prep["W"][active]
+        major_mask = prep["major_mask"][active]
+        minor_mask = prep["minor_mask"][active]
+        rt = prep["rt"][active]
+
+        # Preserve the original multiplication order used for V_kick.
+        V_kick = rc * vcent_ratio[active] * Vesc0
+        V_kick = np.where(np.isfinite(V_kick), V_kick, 0.0)
+        v_k_ms = V_kick * pr.km
+
+        rk = pr.r_k(Mbh_SI, v_k_ms)
+        r_eff_pc = pr.r_eff_from_rk_gamma1(rk) / pr.pc
+
+        Mb_coll_kg = (
+            prep["mb_coll_prefactor_msun"][active]
+            * (r_eff_pc / 0.1) ** 1.25
+        ) * pr.M_sun
+        cap = np.where(
+            np.isfinite(Mb_coll_kg) & (Mb_coll_kg > 0),
+            Mb_coll_kg / M_STAR_SI,
+            0.0,
+        )
+        f_b_raw = Mb_coll_kg / Mbh_SI
+        f_b = np.clip(
+            np.where(np.isfinite(f_b_raw), f_b_raw, 0.0), 0.0, 1.0
+        )
+
+        rk_arr = np.asarray(rk, dtype=float)
+        ln_ratio = np.where(rk_arr > rt, np.log(rk_arr / rt), np.inf)
+        rate_s = (
+            (prep["ln_lambda"][active] / ln_ratio)
+            * (v_k_ms / rk_arr)
+            * f_b
+        )
+        rate_yr = np.where(
+            np.isfinite(rate_s) & (rate_s > 0), rate_s * SEC_PER_YEAR, 0.0
+        )
+
+        if TDECAY_MODE == "vkick":
+            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                t_decay_yr = (
+                    prep["t_decay_mass_prefactor_yr"][active]
+                    * (V_kick / 1.0e3) ** (-3.0)
+                )
+            t_decay_yr = np.where(
+                (V_kick <= 0) & np.isfinite(Mbh),
+                TDECAY_NO_DECAY_YR,
+                t_decay_yr,
+            )
+        elif TDECAY_MODE == "mass_only":
+            t_decay_yr = prep["t_decay_mass_prefactor_yr"][active]
+        else:
+            raise ValueError(f"Unknown TDECAY_MODE: {TDECAY_MODE}")
+        t_decay_yr = np.where(
+            np.isfinite(t_decay_yr) & (t_decay_yr > 0), t_decay_yr, 0.0
+        )
+
+        t_cent_pre = t_leave_all[active]
+        rem_time = np.maximum(0.0, t_cap[active] - t_cent_pre)
+        t_ext_max = rep_t_ext_max[mi, rbin] * scale[active]
+        t_ext = np.where(
+            np.isfinite(t_ext_max) & (t_ext_max > 0),
+            np.minimum(t_ext_max, rem_time),
+            rem_time,
+        )
+
+        # This is the same pair of exponential integrals as integral_exp(),
+        # but exp(-t_cent/t_decay) is evaluated once and reused.
+        ok = (
+            np.isfinite(rate_yr) & (rate_yr > 0) &
+            np.isfinite(t_decay_yr) & (t_decay_yr > 0) &
+            np.isfinite(t_cent_pre) & np.isfinite(t_ext)
+        )
+        N_cent_unc = np.zeros_like(rate_yr)
+        N_ext_unc = np.zeros_like(rate_yr)
+        if np.any(ok):
+            amp = rate_yr[ok] * t_decay_yr[ok]
+            x_pre = np.clip(t_cent_pre[ok] / t_decay_yr[ok], 0.0, 1e6)
+            x_end = np.clip(
+                (t_cent_pre[ok] + t_ext[ok]) / t_decay_yr[ok], 0.0, 1e6
+            )
+            e_pre = np.exp(-x_pre)
+            e_end = np.exp(-x_end)
+            cent_values = amp * (1.0 - e_pre)
+            ext_values = amp * (e_pre - e_end)
+            N_cent_unc[ok] = np.where(
+                np.isfinite(cent_values) & (cent_values > 0), cent_values, 0.0
+            )
+            N_ext_unc[ok] = np.where(
+                (t_ext[ok] > 0) & np.isfinite(ext_values) & (ext_values > 0),
+                ext_values,
+                0.0,
+            )
+
+        N_cent = np.minimum(N_cent_unc, cap)
+        remaining = np.maximum(0.0, cap - N_cent)
+        clipped_ext = np.minimum(N_ext_unc, remaining)
+        N_ext = np.where(
+            np.isfinite(clipped_ext), np.maximum(0.0, clipped_ext), 0.0
+        )
+
+        weighted = W * N_ext
+        ext_run["combined"][:, rbin] = np.bincount(
+            mi, weights=weighted, minlength=N_MASS_ALL
+        )
+        if np.any(major_mask):
+            ext_run["major"][:, rbin] = np.bincount(
+                mi[major_mask], weights=weighted[major_mask], minlength=N_MASS_ALL
+            )
+        if np.any(minor_mask):
+            ext_run["minor"][:, rbin] = np.bincount(
+                mi[minor_mask], weights=weighted[minor_mask], minlength=N_MASS_ALL
+            )
+
+    return ext_run
+
+
+def process_snapshot_all_fcent(z, paths):
+    """Process one redshift snapshot for all F_CENT values in one file pass."""
+    dt_to_z6_yr = float(pr.time_until_z6(z))
+    empty = {
+        float(f): {
+            cls: np.zeros((N_MASS_ALL, N_R), float)
+            for cls in ("major", "minor", "combined")
+        }
+        for f in F_CENT_LIST
+    }
+    if not np.isfinite(dt_to_z6_yr) or dt_to_z6_yr <= 0.0:
+        return {"z": float(z), "used_runs": 0, "means": empty}
+
+    rep_by_fcent = {
+        float(f): (
+            np.full((N_MASS_ALL, N_R), np.nan, float),
+            np.full((N_MASS_ALL, N_R), np.nan, float),
+            np.full(N_MASS_ALL, np.nan, float),
+            np.full(N_MASS_ALL, np.nan, float),
+        )
+        for f in F_CENT_LIST
+    }
+    run_totals = {
+        float(f): {cls: [] for cls in ("major", "minor", "combined")}
+        for f in F_CENT_LIST
+    }
+
+    for path in paths:
+        try:
+            df = _read_and_normalise_catalogue(path)
+        except (KeyError, RuntimeError):
+            # Preserve the original fail-fast behaviour for incompatible or
+            # incomplete catalogues; silently skipping these could bias totals.
+            raise
+        except Exception as exc:
+            print(f"  [warn] could not read {os.path.basename(path)}; skipping ({exc})")
+            continue
+        if df is None or df.empty:
+            continue
+
+        present_bins = _representative_bins_in_catalogue(df)
+        for fcent in F_CENT_LIST:
+            fkey = float(fcent)
+            rep_t_leave, rep_t_ext_max, rep_scale_base, rep_vcent = rep_by_fcent[fkey]
+            missing_present = [b for b in present_bins if not np.isfinite(rep_scale_base[b])]
+            if missing_present:
+                cand_leave, cand_ext, cand_scale, cand_vcent = build_rep_times_for_snapshot(
+                    df, z, fcent
+                )
+                for b in missing_present:
+                    if np.isfinite(cand_scale[b]):
+                        rep_t_leave[b, :] = cand_leave[b, :]
+                        rep_t_ext_max[b, :] = cand_ext[b, :]
+                        rep_scale_base[b] = cand_scale[b]
+                        rep_vcent[b] = cand_vcent[b]
+
+        prep = _prepare_run_arrays(df)
+        if prep is None:
+            continue
+
+        for fcent in F_CENT_LIST:
+            fkey = float(fcent)
+            ext_run = _scan_prepared_run(
+                prep, dt_to_z6_yr, rep_by_fcent[fkey]
+            )
+            for cls in run_totals[fkey]:
+                run_totals[fkey][cls].append(ext_run[cls])
+
+    used_runs = len(run_totals[float(F_CENT_LIST[0])]["combined"])
+    means = empty
+    if used_runs:
+        for fcent in F_CENT_LIST:
+            fkey = float(fcent)
+            for cls in means[fkey]:
+                stack = np.stack(run_totals[fkey][cls], axis=0)
+                mean_z = np.mean(stack, axis=0)
+                means[fkey][cls] = np.where(
+                    np.isfinite(mean_z) & (mean_z >= 0), mean_z, 0.0
+                )
+
+    return {"z": float(z), "used_runs": used_runs, "means": means}
+
+
+# ===================== OUTPUT FINALISATION =====================
+def finalize_one_fcent(F_CENT, totals, n_runs_nominal):
+    """Extract peaks and write the same JSON/XLSX outputs as the original scan."""
+    tag_fcent = fcent_tag(F_CENT)
     xlsx_out = os.path.join(BASE_DIR, f"{SCRIPT_STEM}_tables__{tag_fcent}.xlsx")
     json_out = os.path.join(BASE_DIR, f"{SCRIPT_STEM}_rpeak__{tag_fcent}.json")
 
-    OUT_TAG = f"total_{n_runs_nominal:02d}runs" if n_runs_nominal > 1 else "total_single"
-    OUT_TAG = f"{OUT_TAG}__{tag_fcent}__tdecay-{TDECAY_MODE}__physA__vcent"
+    if not np.allclose(
+        totals["combined"], totals["major"] + totals["minor"],
+        rtol=1e-10, atol=1e-6,
+    ):
+        raise RuntimeError("Combined ratio-scan grid does not equal major + minor totals.")
+
+    rpeak_by_class = {cls: {} for cls in totals}
+    peaks_rows = []
+    overall_best = {"val": -np.inf, "R": np.nan, "bin": None}
 
     print("\n" + "=" * 86)
-    print(f"[ratio_scan_vcent] START: F_CENT={F_CENT:.2f}  ({tag_fcent})")
+    print(f"[ratio_scan_vcent] RESULTS: F_CENT={F_CENT:.2f} ({tag_fcent})")
     print("=" * 86)
-    print(f"  R in [{RATIO_MIN:.2f}, {RATIO_MAX:.2f}],  DR={DR:.3f},  N_R={N_R}")
-    print(f"  Ratio definition: R = V_kick / V_cent  (R_cent = F_CENT * R_e)")
-    print(f"  Mass bins: {N_MASS_ALL}")
-    if HAVE_PYARROW:
-        print("  pyarrow available: reading only required Parquet columns.")
-    else:
-        print("  pyarrow not available: full Parquet reads (slower).")
 
-    # Accumulate physical TDE totals across all snapshots
-    ext_tde_tot = np.zeros((N_MASS_ALL, N_R), float)
-
-    for z in Zs:
-        paths = paths_by_z[z]
-        print(f"\n=== [z={z:.2f}] {len(paths)} run file(s) ===")
-
-        dt_to_z6_yr = float(pr.time_until_z6(z))
-        if not np.isfinite(dt_to_z6_yr) or dt_to_z6_yr <= 0:
-            print(f"  [warn] time_until_z6(z={z:.2f}) invalid ({dt_to_z6_yr}); skipping.")
-            continue
-
-        n_phys_by_m = np.zeros(N_MASS_ALL, dtype=float)
-        for m in range(N_MASS_ALL):
-            lo = float(MASS_EDGES_ALL[m])
-            hi = float(MASS_EDGES_ALL[m + 1])
-            n_phys_by_m[m] = float(phys_map.get(_bin_key(z, lo, hi), 0))
-
-        ext_mean_runs    = []
-        rep_cache_ready  = False
-        rep_t_leave = rep_t_ext_max = rep_scale_base = rep_Vcent_over_Vesc0 = None
-
-        for path in paths:
-            try:
-                if HAVE_PYARROW:
-                    schema_cols  = set(pq.ParquetFile(path).schema.names)
-                    cols_to_read = [c for c in NEEDED_CAND_COLS if c in schema_cols]
-                    df = pd.read_parquet(path, columns=cols_to_read) if cols_to_read else pd.read_parquet(path)
-                else:
-                    df = pd.read_parquet(path)
-            except Exception as e:
-                print(f"  [warn] could not read {os.path.basename(path)}; skipping ({e})")
-                continue
-
-            if df is None or len(df) == 0:
-                continue
-
-            c_mstar = first_col(df, CAND["MSTAR"])
-            c_mbh   = first_col(df, CAND["MBH"])
-            c_re    = first_col(df, CAND["RE"])
-            c_vesc  = first_col(df, CAND["VESC"])
-            c_w     = first_col(df, CAND["W"])
-
-            if any(x is None for x in [c_mstar, c_mbh, c_re, c_vesc]):
-                raise KeyError(
-                    "Missing required columns. Need equivalents of:\n"
-                    "  Mstar_rem_Msun, Mrem_BH_Msun, Re_kpc, Vesc0_kms\n"
-                    f"  Detected: MSTAR={c_mstar}, MBH={c_mbh}, RE={c_re}, VESC={c_vesc}"
-                )
-
-            df = df.rename(columns={c_mstar: "_MSTAR", c_mbh: "_MBH",
-                                     c_re: "_RE",    c_vesc: "_VESC"})
-            if c_w is not None:
-                df = df.rename(columns={c_w: "_W"})
+    for m, lab in enumerate(MASS_LABELS_ALL):
+        peaks = {}
+        indices = {}
+        for cls in totals:
+            row = totals[cls][m]
+            if np.any(np.isfinite(row)) and np.nanmax(row) > 0:
+                idx = int(np.nanargmax(row))
+                peaks[cls] = float(RATIO_CENTERS[idx])
+                indices[cls] = idx
             else:
-                df["_W"] = 1.0
+                peaks[cls] = float(RATIO_CENTERS[0])
+                indices[cls] = 0
+            rpeak_by_class[cls][lab] = peaks[cls]
 
-            if not rep_cache_ready:
-                rep_t_leave, rep_t_ext_max, rep_scale_base, rep_Vcent_over_Vesc0 = \
-                    build_rep_times_for_snapshot(df, z, F_CENT)
-                rep_cache_ready = True
-
-                good = np.isfinite(rep_Vcent_over_Vesc0) & (rep_Vcent_over_Vesc0 > 0)
-                if np.any(good):
-                    med_ratio = float(np.nanmedian(rep_Vcent_over_Vesc0[good]))
-                    print(f"  [rep] median V_cent / V_esc(0) across populated bins: {med_ratio:.4f}")
-
-            Mstar = pd.to_numeric(df["_MSTAR"], errors="coerce").to_numpy(float)
-            Mbh   = pd.to_numeric(df["_MBH"],   errors="coerce").to_numpy(float)
-            Re    = pd.to_numeric(df["_RE"],     errors="coerce").to_numpy(float)
-            Vesc0 = pd.to_numeric(df["_VESC"],   errors="coerce").to_numpy(float)
-            W     = pd.to_numeric(df["_W"],      errors="coerce").to_numpy(float)
-
-            logM   = np.log10(Mstar, where=(Mstar > 0), out=np.full_like(Mstar, np.nan))
-            mass_i = np.digitize(logM, MASS_EDGES_ALL) - 1
-
-            valid = (
-                (mass_i >= 0) & (mass_i < N_MASS_ALL) &
-                np.isfinite(Mbh)   & (Mbh   > 0) &
-                np.isfinite(Re)    & (Re    > 0) &
-                np.isfinite(Vesc0) & (Vesc0 > 0) &
-                np.isfinite(W)     & (W     > 0)
-            )
-            if not np.any(valid):
-                continue
-
-            mass_i = mass_i[valid].astype(int)
-            Mbh    = Mbh[valid]
-            Re     = Re[valid]
-            Vesc0  = Vesc0[valid]
-            W      = W[valid]
-
-            w_by_m = np.bincount(mass_i, weights=W, minlength=N_MASS_ALL).astype(float)
-            denom  = np.where(w_by_m > 0, w_by_m, np.nan)[:, None]
-
-            ext_tde_sum_run = np.zeros((N_MASS_ALL, N_R), float)
-
-            # Pre-compute BH-only quantities (independent of ratio bin)
-            Mbh_SI      = Mbh * pr.M_sun
-            sigma_km_s, _ = pr.sigma_from_mbh(Mbh_SI)
-            rt          = pr.r_t(Mbh_SI, M_STAR_SI, R_SUN_M)
-
-            # Per-galaxy scaling of representative travel times via Re/Vesc0
-            base  = rep_scale_base[mass_i]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                scale = (Re / Vesc0) / base
-            scale = np.where(np.isfinite(scale) & (scale > 0), scale, 1.0)
-
-            Vcent_over_Vesc0 = rep_Vcent_over_Vesc0[mass_i]
-            Vcent_over_Vesc0 = np.where(
-                np.isfinite(Vcent_over_Vesc0) & (Vcent_over_Vesc0 > 0),
-                Vcent_over_Vesc0, 1.0,
-            )
-
-            # Integration cap: full time to z = 6 per galaxy
-            t_cap = np.where(
-                np.isfinite(np.full_like(Mbh, dt_to_z6_yr)) & (dt_to_z6_yr > 0),
-                dt_to_z6_yr, 0.0,
-            )
-
-            for rbin, rc in enumerate(RATIO_CENTERS):
-                # V_kick = R * V_cent = R * (V_cent/V_esc(0)) * V_esc(0)
-                V_kick    = rc * Vcent_over_Vesc0 * Vesc0
-                V_kick    = np.where(np.isfinite(V_kick) & (V_kick >= 0), V_kick, 0.0)
-                v_k_ms    = V_kick * pr.km
-
-                rk        = pr.r_k(Mbh_SI, v_k_ms)
-                r_eff_pc  = (pr.r_eff_from_rk_gamma1(rk) / pr.pc)
-
-                Mb_coll_kg = pr.m_b_collisional(Mbh, sigma_km_s, r_eff_pc)
-                cap_stars  = Mb_coll_kg / pr.M_sun
-                cap        = np.where(np.isfinite(cap_stars) & (cap_stars > 0), cap_stars, 0.0)
-
-                f_b = pr.f_b_from_mb(Mb_coll_kg, Mbh_SI)
-                f_b = np.clip(np.where(np.isfinite(f_b), f_b, 0.0), 0.0, 1.0)
-
-                rate_s  = pr.tde_rate_resonant(Mbh_SI, M_STAR_SI, rk, rt, v_k_ms, f_b)
-                rate_yr = np.where(np.isfinite(rate_s) & (rate_s > 0), rate_s * SEC_PER_YEAR, 0.0)
-
-                if TDECAY_MODE == "vkick":
-                    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-                        t_decay_yr = 1.5e9 * (Mbh / 1.0e7) ** 2 * (V_kick / 1.0e3) ** (-3.0)
-                    t_decay_yr = np.where(
-                        (V_kick <= 0) & np.isfinite(Mbh), TDECAY_NO_DECAY_YR, t_decay_yr
-                    )
-                elif TDECAY_MODE == "mass_only":
-                    t_decay_yr = 1.5e9 * (Mbh / 1.0e7) ** 2
-                else:
-                    raise ValueError(f"Unknown TDECAY_MODE: {TDECAY_MODE}")
-
-                t_decay_yr = np.where(
-                    np.isfinite(t_decay_yr) & (t_decay_yr > 0), t_decay_yr, 0.0
-                )
-
-                # Orbit segmentation: central and external exposure times.
-                rep_leave = rep_t_leave[mass_i, rbin]
-                t_leave   = rep_leave * scale
-                t_leave   = np.where(np.isfinite(t_leave) & (t_leave > 0), t_leave, np.nan)
-
-                leaves       = np.isfinite(t_leave) & (t_leave < t_cap)
-                t_cent_pre   = np.where(leaves, t_leave, t_cap)
-
-                t_ext    = np.zeros_like(t_cap)
-                rem_time = np.maximum(0.0, t_cap - t_cent_pre)
-
-                rep_ext_max = rep_t_ext_max[mass_i, rbin]
-                t_ext_max   = rep_ext_max * scale
-
-                has_ext_max = leaves & np.isfinite(t_ext_max) & (t_ext_max > 0)
-                t_ext[has_ext_max]  = np.minimum(t_ext_max[has_ext_max], rem_time[has_ext_max])
-                t_ext[leaves & ~has_ext_max] = rem_time[leaves & ~has_ext_max]
-
-                # Integrate the exponential TDE rate over each orbit segment.
-                N_cent_pre_unc = integral_exp(rate_yr, t_decay_yr, 0.0, t_cent_pre)
-                t_leave_eff    = np.where(t_ext > 0, t_cent_pre, 0.0)
-                N_ext_unc      = integral_exp(rate_yr, t_decay_yr, t_leave_eff, t_leave_eff + t_ext)
-
-                # Apply the bound-star cap sequentially so external events cannot
-                # exceed the remaining bound reservoir.
-                N_cent_pre = np.minimum(N_cent_pre_unc, cap)
-                rem        = np.maximum(0.0, cap - N_cent_pre)
-                N_ext_fin  = np.where(
-                    np.isfinite(np.minimum(N_ext_unc, rem)) & (np.minimum(N_ext_unc, rem) > 0),
-                    np.minimum(N_ext_unc, rem), 0.0,
-                )
-
-                ext_tde_sum_run[:, rbin] += np.bincount(
-                    mass_i, weights=W * N_ext_fin, minlength=N_MASS_ALL
-                )
-
-            ext_mean_run = np.where(np.isfinite(denom), ext_tde_sum_run / denom, np.nan)
-            ext_mean_runs.append(ext_mean_run)
-
-        if not ext_mean_runs:
-            print("  -> no usable run files; skipping snapshot")
-            continue
-
-        ext_mean_z = np.nanmean(np.stack(ext_mean_runs, axis=0), axis=0)
-        ext_mean_z = np.where(np.isfinite(ext_mean_z) & (ext_mean_z >= 0), ext_mean_z, 0.0)
-
-        ext_tde_tot += ext_mean_z * n_phys_by_m.astype(float)[:, None]
-        print(f"  -> used {len(ext_mean_runs)} run(s); added physical totals for this snapshot")
-
-    # ===================== PEAK RATIOS =====================
-    print("\n[Peak ratios] External TDE TOTAL expected TDEs — all mass bins:")
-    print("  R_peak is defined as R = V_kick / V_cent.")
-    overall_best = {"val": -np.inf, "R": np.nan, "bin": None}
-    peaks_rows   = []
-    rpeak_by_bin = {}
-
-    for m in range(N_MASS_ALL):
-        lab = MASS_LABELS_ALL[m]
-        row = ext_tde_tot[m, :]
-        if np.any(np.isfinite(row)) and np.nanmax(row) > 0:
-            jj  = int(np.nanargmax(row))
-            rpk = float(RATIO_CENTERS[jj])
-            tpk = float(row[jj])
-            print(f"  {lab}: R_peak = {rpk:.3f}   (peak total = {tpk:.6g})")
-        else:
-            rpk = float(RATIO_CENTERS[0])
-            tpk = 0.0
-            print(f"  {lab}: R_peak = {rpk:.3f}   (peak total = 0)")
-
-        rpeak_by_bin[lab] = rpk
+        j_comb = indices["combined"]
+        combined_peak = float(totals["combined"][m, j_comb])
+        major_at_combined = float(totals["major"][m, j_comb])
+        minor_at_combined = float(totals["minor"][m, j_comb])
         peaks_rows.append({
-            "bin_label":           lab,
-            "bin_lo_log10M":       float(MASS_EDGES_ALL[m]),
-            "bin_hi_log10M":       float(MASS_EDGES_ALL[m + 1]),
-            "R_peak":              rpk,
-            "peak_total_ext_tdes": tpk,
+            "bin_label": lab,
+            "bin_lo_log10M": float(MASS_EDGES_ALL[m]),
+            "bin_hi_log10M": float(MASS_EDGES_ALL[m + 1]),
+            "R_peak_combined": peaks["combined"],
+            "peak_total_combined": combined_peak,
+            "R_peak_major": peaks["major"],
+            "R_peak_minor": peaks["minor"],
+            "major_at_combined_peak": major_at_combined,
+            "minor_at_combined_peak": minor_at_combined,
         })
+        print(
+            f"  {lab}: combined R_peak={peaks['combined']:.3f}, "
+            f"N_ext={combined_peak:.6g} "
+            f"(major={major_at_combined:.6g}, minor={minor_at_combined:.6g})"
+        )
+        if combined_peak > overall_best["val"]:
+            overall_best = {"val": combined_peak, "R": peaks["combined"], "bin": lab}
 
-        if np.isfinite(tpk) and tpk > overall_best["val"]:
-            overall_best = {"val": tpk, "R": rpk, "bin": lab}
-
-    if np.isfinite(overall_best["val"]) and overall_best["bin"] is not None:
-        print(f"[Overall max] {overall_best['bin']}: R = {overall_best['R']:.3f}   "
-              f"total = {overall_best['val']:.6g}")
-
-    # ===================== SAVE TABLES =====================
     meta = {
-        "script":           SCRIPT_STEM,
+        "script": SCRIPT_STEM,
         "ratio_definition": "R = V_kick / V_cent",
-        "F_CENT":           float(F_CENT),
-        "TDECAY_MODE":      str(TDECAY_MODE),
-        "RATIO_MIN":        float(RATIO_MIN),
-        "RATIO_MAX":        float(RATIO_MAX),
-        "DR":               float(DR),
-        "R_centers":        [float(x) for x in RATIO_CENTERS],
-        "parquet_root":     PARQUET_ROOT,
-        "targets_file":     TARGETS_PQ,
-        "out_tag":          OUT_TAG,
+        "F_CENT": float(F_CENT),
+        "TDECAY_MODE": str(TDECAY_MODE),
+        "RATIO_MIN": float(RATIO_MIN),
+        "RATIO_MAX": float(RATIO_MAX),
+        "DR": float(DR),
+        "R_centers": [float(x) for x in RATIO_CENTERS],
+        "mass_bin_meaning": "descendant galaxy stellar mass",
+        "production_peak_population": "combined major+minor",
+        "weighting": "direct sum(weight * N_TDE); no second target multiplication",
+        "parquet_root": PARQUET_ROOT,
+        "nominal_runs": int(n_runs_nominal),
+        "optimisation": (
+            "shared F_CENT file pass; cached ratio-invariant row quantities; "
+            "early zero-external-row skip; deterministic snapshot parallelism"
+        ),
+        "workers": int(N_WORKERS),
     }
 
     peaks_df = pd.DataFrame(peaks_rows)
-    if overall_best["bin"] is not None:
-        peaks_df = pd.concat([
-            peaks_df,
-            pd.DataFrame([{
-                "bin_label":           "OVERALL_MAX",
-                "bin_lo_log10M":       np.nan,
-                "bin_hi_log10M":       np.nan,
-                "R_peak":              float(overall_best["R"]),
-                "peak_total_ext_tdes": float(overall_best["val"]),
-            }])
-        ], ignore_index=True)
+    grid_dfs = {}
+    for cls, arr in totals.items():
+        grid_df = pd.DataFrame({"R_center": RATIO_CENTERS})
+        for m, lab in enumerate(MASS_LABELS_ALL):
+            grid_df[lab] = arr[m]
+        grid_dfs[cls] = grid_df
 
-    grid_df = pd.DataFrame({"R_center": RATIO_CENTERS})
-    for m, lab in enumerate(MASS_LABELS_ALL):
-        grid_df[lab] = ext_tde_tot[m, :]
-
-    write_peak_json(json_out, meta, peaks_rows, rpeak_by_bin, overall_best)
-    write_tables_xlsx(xlsx_out, peaks_df, grid_df)
-
-    print(f"[ratio_scan_vcent] DONE: F_CENT={F_CENT:.2f}  -> tables saved ({tag_fcent})")
-    return ext_tde_tot
+    write_peak_json(
+        json_out, meta, peaks_rows, rpeak_by_class["combined"], overall_best,
+        rpeak_by_class, totals,
+    )
+    write_tables_xlsx(xlsx_out, peaks_df, grid_dfs)
+    print(f"[ratio_scan_vcent] DONE: F_CENT={F_CENT:.2f}")
+    return totals
 
 
 # ===================== MAIN =====================
 def main():
-    """Run the ratio scan for all configured central-boundary choices and save the comparison figure."""
+    """Run both boundary scans with shared I/O and optional snapshot parallelism."""
     plt.rcParams.update({
         "font.size":      12,
         "axes.titlesize": 14,
@@ -887,19 +1099,66 @@ def main():
         "legend.fontsize": 10,
     })
 
-    df_targets = load_bin_targets_physical()
-    phys_map   = build_phys_target_map(df_targets)
-    print(f"[targets] Loaded from: {TARGETS_PQ}")
-    print(f"[targets] Entries: {len(phys_map):,}")
+    Zs, paths_by_z = discover_parquet_snapshots(PARQUET_ROOT)
+    n_runs_nominal = max(len(v) for v in paths_by_z.values())
+    workers = min(N_WORKERS, len(Zs))
 
-    Zs, paths_by_z   = discover_parquet_snapshots(PARQUET_ROOT)
-    n_runs_nominal    = max(len(v) for v in paths_by_z.values())
+    print("\n" + "=" * 86)
+    print("[ratio_scan_vcent] FAST SCAN")
+    print(f"  snapshots       : {len(Zs)}")
+    print(f"  nominal runs    : {n_runs_nominal}")
+    print(f"  F_CENT values   : {F_CENT_LIST}")
+    print(f"  worker processes: {workers}")
+    print("=" * 86)
 
-    # Run scan for each F_CENT value
+    snapshot_results = {}
+    if workers == 1:
+        for z in Zs:
+            print(f"\n=== [z={z:.2f}] {len(paths_by_z[z])} run file(s) ===")
+            result = process_snapshot_all_fcent(z, paths_by_z[z])
+            snapshot_results[float(z)] = result
+            print(f"  -> used {result['used_runs']} run(s); completed both F_CENT scans")
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            future_to_z = {
+                executor.submit(process_snapshot_all_fcent, z, paths_by_z[z]): float(z)
+                for z in Zs
+            }
+            for future in as_completed(future_to_z):
+                z = future_to_z[future]
+                result = future.result()
+                snapshot_results[z] = result
+                print(
+                    f"  [z={z:.2f}] used {result['used_runs']} run(s); "
+                    "completed both F_CENT scans"
+                )
+
+    totals_all = {
+        float(f): {
+            cls: np.zeros((N_MASS_ALL, N_R), float)
+            for cls in ("major", "minor", "combined")
+        }
+        for f in F_CENT_LIST
+    }
+
+    # Add snapshots in the same descending-redshift order as the original
+    # serial script, independent of the order in which workers finished.
+    for z in Zs:
+        result = snapshot_results.get(float(z))
+        if result is None:
+            continue
+        for fcent in F_CENT_LIST:
+            fkey = float(fcent)
+            for cls in totals_all[fkey]:
+                totals_all[fkey][cls] += result["means"][fkey][cls]
+
     results = []
     for fcent in F_CENT_LIST:
-        ext_tde_tot = run_one_fcent(fcent, Zs, paths_by_z, phys_map, n_runs_nominal)
-        results.append((fcent, ext_tde_tot))
+        fkey = float(fcent)
+        finalized = finalize_one_fcent(fcent, totals_all[fkey], n_runs_nominal)
+        results.append((fcent, finalized))
+
+    write_figure_data_json(FIGURE_DATA_JSON, results)
 
     # ===================== COMBINED FIGURE =====================
     out_png = os.path.join(FIG_DIR, "external_tdes_vs_ratio_fcent_comparison.png")
@@ -907,8 +1166,12 @@ def main():
     fig, axes = plt.subplots(1, 2, figsize=(15.8, 5.3), sharex=True)
 
     ext_tde_plots = [
-        np.where(np.isfinite(ext_tde_tot) & (ext_tde_tot > 0), ext_tde_tot, np.nan)
-        for _, ext_tde_tot in results
+        np.where(
+            np.isfinite(totals_by_class["combined"]) & (totals_by_class["combined"] > 0),
+            totals_by_class["combined"],
+            np.nan,
+        )
+        for _, totals_by_class in results
     ]
 
     all_pos = np.concatenate([p[np.isfinite(p)] for p in ext_tde_plots]) if ext_tde_plots else np.array([])
@@ -950,15 +1213,17 @@ def main():
         else:
             ok, _, _ = set_logy_positive(ax, ext_plot)
             if not ok:
-                print(f"[plot] Warning: no positive external TDE totals for fcent={fcent:.2f}; "
-                      "leaving y-axis linear.")
+                print(
+                    f"[plot] Warning: no positive external TDE totals for "
+                    f"fcent={fcent:.2f}; leaving y-axis linear."
+                )
 
     axes[0].set_ylabel(r"$N_{\rm TDE}$")
 
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(
         handles, labels,
-        title="Host mass [log10 M*]",
+        title="Descendant mass [log10 M*]",
         bbox_to_anchor=(1.01, 0.98),
         loc="upper left",
     )
