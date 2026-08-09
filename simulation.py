@@ -2,1119 +2,856 @@
 """
 simulation.py
 -------------
-Full Monte Carlo pipeline for BH merger remnants across the EoR (z = 11.8 -> 6.2).
+Final downstream recoil/TDE simulation for the revised explicit galaxy-pair
+population.
 
-This is the final downstream Monte Carlo catalogue used for external-TDE and
-ionising-energy post-processing.
+This version does not regenerate the Monte Carlo population.  It reuses the
+catalogues already produced by ratio_scan_sample_gen.py, which guarantees that
+the final simulation and the V_kick/V_cent scan use the same major+minor merger
+events, descendant mass bins, and single cap-rescaling weight.
 
 Inputs
 ------
-  - ratio_scan_vcent_rpeak__<fcent_tag>.json
+  ratio_scan_catalogue/runXX/data_z_*.parquet
+  ratio_scan_vcent_rpeak__fcent0p05.json
 
-For each redshift snapshot the pipeline:
-  1. Computes expected galaxy counts and merger targets per stellar-mass bin
-     using the FIRE-2 GSMF and the Duan+2025 merger rate.
-  2. Draws BH–BH merger events by rejection sampling and computes remnant
-     properties (Mrem, M*, Re, Vesc0, q).
-  3. Assigns a GW recoil kick to each remnant using the per-bin peak ratio
-     R_peak = V_kick / V_cent, loaded from the JSON output of ratio_scan_vcent.py.
-     V_cent is the speed needed to reach R_cent = F_NUC * Re from the centre.
-  4. Attaches TDE fields: rate, orbit travel times, and expected TDE counts
-     split by phase (central phase before boundary crossing and external phase
-     after boundary crossing).
-  5. Saves lean per-snapshot Parquet files to simulation_results/<run_tag>/.
+For each catalogue the script:
+  1. validates the shared population-model version;
+  2. loads the combined major+minor R_peak for each descendant mass bin;
+  3. assigns V_kick = R_peak V_cent using the same representative-potential
+     prescription as ratio_scan_vcent.py;
+  4. computes the central/external orbit times and TDE counts;
+  5. writes the enriched catalogue to simulation_results/runXX/.
 
-Dependencies
-------------
-  physics_relations.py    — all physical scaling laws
-  ratio_scan_vcent.py     — must be run first to produce the peak-ratio JSON
+The expensive population sampling is therefore performed only once, upstream.
+All physical equations are unchanged.  Speed improvements come from catalogue
+reuse, vectorised TDE calculations, one representative orbit calculation per
+(snapshot, descendant bin), minimal Parquet I/O, and optional snapshot-level
+parallelism.
 
 Outputs
 -------
-  - simulation_results/runXX/data_z_*.parquet
+  simulation_results/runXX/data_z_*.parquet
 """
+
+from __future__ import annotations
 
 import os
 
-# Limit BLAS thread counts before importing NumPy for reproducible, stable runtime.
+# Keep each worker single-threaded.  Parallelism is across independent files.
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS",      "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS",  "1")
-os.environ.setdefault("OMP_NUM_THREADS",      "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 
-import gc
 import json
 import math
+import re
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+from typing import Iterable
+
 import numpy as np
 import pandas as pd
-import astropy.units as u
-from astropy.cosmology import FlatLambdaCDM
 
+import merger_pair_sampling as mps
 import physics_relations as pr
-from physics_relations import (
-    # GSMF and cosmology
-    gsmf_number_density_in_bin, merger_rate_z, age_of_universe_at_z, time_until_z6,
-    # BH-galaxy mapping and galaxy sizes
-    RV15AGNParams, mstar_from_mbh, re_kpc_m24, FIRE2_SHMR_Params,
-    # Non-spinning remnant mass
-    final_mass_and_fraction_ns_jf2017,
-    # Host potential and halo helpers
-    fire2_log10_mh_from_mstar, vesc0_nfw_hernquist,
-    # Orbit helpers
-    r_vir_mpc, nfw_concentration,
-    # TDE helpers and SI constants
-    r_k, sigma_from_mbh, r_eff_from_rk_gamma1, r_t,
-    m_b_collisional, f_b_from_mb, tde_rate_resonant,
-    G, M_sun, pc, km,
-)
-
-_TRAPZ = getattr(np, "trapezoid", np.trapz)
 
 
-# ===========================================================================
-# Paths
-# ===========================================================================
+# ============================================================================
+# Paths and execution controls
+# ============================================================================
 
 try:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    BASE_DIR = Path(__file__).resolve().parent
 except NameError:
-    BASE_DIR = os.getcwd()
+    BASE_DIR = Path.cwd()
 
-RESULTS_DIR = os.path.join(BASE_DIR, "simulation_results")
+CATALOGUE_DIR = BASE_DIR / "ratio_scan_catalogue"
+RESULTS_DIR = BASE_DIR / "simulation_results"
+
+F_NUC = 0.05
+F_BULGE = float(mps.F_BULGE)
+HERNQUIST_RE_OVER_A = 1.8153
+
+# Same representative-orbit integration resolution as ratio_scan_vcent.py.
+N_INT = 320
+
+# Two workers matches the conservative setting used by the updated ratio scan.
+# Set SIMULATION_WORKERS=1 for serial execution or increase it when RAM allows.
+DEFAULT_WORKERS = 2
+N_WORKERS = max(1, int(os.environ.get("SIMULATION_WORKERS", DEFAULT_WORKERS)))
+
+PRINT_PER_FILE_SUMMARY = True
 
 
-# ===========================================================================
-# Parquet engine detection
-# ===========================================================================
+# ============================================================================
+# Shared mass bins and ratio grid
+# ============================================================================
+
+MASS_EDGES = np.asarray(mps.DESCENDANT_LOGM_EDGES, dtype=float)
+MASS_LABELS = [mps.bin_label(MASS_EDGES[i], MASS_EDGES[i + 1])
+               for i in range(len(MASS_EDGES) - 1)]
+N_MASS = len(MASS_LABELS)
+
+RATIO_MIN = 1.0
+RATIO_MAX = 10.0
+DR = 0.10
+N_R = int(np.round((RATIO_MAX - RATIO_MIN) / DR))
+RATIO_EDGES = RATIO_MIN + DR * np.arange(N_R + 1)
+RATIO_CENTERS = RATIO_EDGES[:-1] + 0.5 * DR
+
+
+# ============================================================================
+# Physical constants and TDE controls
+# ============================================================================
+
+SEC_PER_YEAR = 365.25 * 24.0 * 3600.0
+KPC_TO_KM = 3.085677581e16
+M_STAR_SI = 1.3 * pr.M_sun
+R_STAR_SI = 1.3 * 6.957e8
+
+TDECAY_MODE = "vkick"
+TDECAY_NO_DECAY_YR = 1.0e30
+
+
+# ============================================================================
+# Parquet support
+# ============================================================================
 
 _PARQUET_ENGINE = None
-_PARQUET_CODEC  = None
-
+_PARQUET_CODEC = None
 try:
     import pyarrow as pa
+
     _PARQUET_ENGINE = "pyarrow"
     try:
-        _zstd_ok = pa.Codec.is_available("zstd")
+        _PARQUET_CODEC = "zstd" if pa.Codec.is_available("zstd") else "snappy"
     except Exception:
-        _zstd_ok = False
-    _PARQUET_CODEC = "zstd" if _zstd_ok else "snappy"
+        _PARQUET_CODEC = "snappy"
 except ImportError:
     try:
         import fastparquet  # noqa: F401
+
         _PARQUET_ENGINE = "fastparquet"
         try:
             from fastparquet.compress import compr
+
             _PARQUET_CODEC = "ZSTD" if "ZSTD" in compr else "SNAPPY"
         except Exception:
             _PARQUET_CODEC = "SNAPPY"
-    except ImportError:
+    except ImportError as exc:
         raise ImportError(
             "A Parquet engine is required. Install pyarrow: pip install pyarrow"
-        )
+        ) from exc
 
 
-# ===========================================================================
-# Cosmology
-# ===========================================================================
+SOURCE_COLUMNS = [
+    "event_id", "run_id", "z", "z_rate", "population_model_version",
+    "merger_class",
+    "descendant_bin_lo_log10M", "descendant_bin_hi_log10M",
+    "desc_bin_lo_log10M", "desc_bin_hi_log10M",
+    "bin_lo_log10M", "bin_hi_log10M",
+    "Mstar_primary_Msun", "Mstar_secondary_Msun", "mu_star",
+    "m1_BH_Msun", "m2_BH_Msun", "q", "Mrem_BH_Msun",
+    "Mstar_rem_Msun", "Re_kpc", "log10_Mh_fire2", "Vesc0_kms",
+    "weight",
+]
 
-cosmo = FlatLambdaCDM(H0=67.74, Om0=0.31, Ob0=0.048, Tcmb0=2.725 * u.K)
-
-
-# ===========================================================================
-# EoR redshift window
-# ===========================================================================
-
-Z_EOR_INITIAL = 12.0   # upper EoR boundary (cosmic-age reference)
-Z_START       = 11.8   # first snapshot
-Z_END         = 6.2    # last snapshot (inclusive)
-DZ_SNAP       = -0.2   # step between snapshots
-
-
-# ===========================================================================
-# Mass binning  (log10 M_sun)
-# ===========================================================================
-
-LOGM_MIN  = 6.75
-LOGM_MAX  = 11.65
-BIN_WIDTH = 0.35
-
-# Stellar-mass bins retained in the ratio scan and final output.
-KEEP_LOGM_MIN = 6.75
-KEEP_LOGM_MAX = 9.90
+REQUIRED_SOURCE_COLUMNS = {
+    "population_model_version", "merger_class",
+    "Mstar_rem_Msun", "Mrem_BH_Msun", "Re_kpc",
+    "log10_Mh_fire2", "Vesc0_kms", "weight",
+}
 
 
-# ===========================================================================
-# BH mass bounds
-# ===========================================================================
-
-MBH_MIN      = 1.0e3   # lower component mass [M_sun]; log10 = 3
-MBH_MAX      = 1.0e6   # upper component mass [M_sun]; log10 = 6
-MBH_POST_MAX = 2.0e6   # remnant cap [M_sun] — equal-mass merger at MBH_MAX
+# ============================================================================
+# Catalogue discovery and validation
+# ============================================================================
 
 
-# ===========================================================================
-# Physical / model parameters
-# ===========================================================================
-
-DZ_SLICE   = 0.01            # comoving shell thickness for galaxy counts
-OMEGA_FULL = 4.0 * np.pi     # full sky [sr]
-MIN_COUNT  = 1.0             # minimum galaxy count to include a bin
-
-F_BULGE           = 0.1548   # bulge mass fraction (= Omega_b / Omega_m)
-F_NUC             = 0.05     # central-boundary radius as a fraction of Re
-HERNQUIST_RE_OVER_A = 1.8153 # Hernquist scale length from effective radius
-
-SEC_PER_YEAR = 365.25 * 24.0 * 3600.0
-KPC_TO_KM    = (1000.0 * pc) / km
+def _parse_redshift_from_filename(filename: str) -> float | None:
+    """Extract z from data_z_11_8.parquet-like filenames."""
+    match = re.fullmatch(r"data_z_(\d+(?:_\d+)?)\.parquet", filename)
+    if match is None:
+        return None
+    try:
+        return round(float(match.group(1).replace("_", ".")), 2)
+    except ValueError:
+        return None
 
 
-# ===========================================================================
-# Monte Carlo controls
-# ===========================================================================
-
-N_RUNS           = 10
-BASE_SEED        = 12345
-SEED_STRIDE      = 10_000
-
-MAX_EVENTS_PER_BIN   = 50_000   # per-(snapshot, bin) sampling cap
-MAX_TRIES_MULTIPLIER = 200
-MAX_TRIES_PER_BIN    = 200_000
-
-
-# ===========================================================================
-# Cached GSMF integrals
-# ===========================================================================
-
-_gsmf_cache = {}
-
-rv15         = RV15AGNParams()
-fire2_params = FIRE2_SHMR_Params()
-
-_LOG10_MBH_MIN = float(np.log10(MBH_MIN))
-
-
-# ===========================================================================
-# Peak-ratio table — loaded from ratio_scan_vcent.py JSON output
-# ===========================================================================
-
-def load_peak_ratios(f_nuc: float = F_NUC) -> dict:
-    """
-    Load per-bin peak kick ratios R_peak = V_kick / V_cent from the JSON file
-    produced by the ratio scan for the same central-boundary choice.
-
-    The JSON filename follows the convention:
-        ratio_scan_vcent_rpeak__fcent{F_NUC_tag}.json
-    where the tag converts dots to 'p', e.g. 0.05 → 'fcent0p05'.
-    """
-    tag      = f"fcent{f_nuc:.2f}".replace(".", "p")
-    filename = f"ratio_scan_vcent_rpeak__{tag}.json"
-    path     = os.path.join(BASE_DIR, filename)
-
-    if not os.path.exists(path):
+def discover_catalogues(root: Path = CATALOGUE_DIR) -> tuple[list[float], dict[float, list[Path]]]:
+    """Return descending redshifts and sorted run files for each snapshot."""
+    if not root.is_dir():
         raise FileNotFoundError(
-            f"Peak-ratio JSON not found: {path}\n"
-            "Run ratio_scan_vcent.py first to generate it."
+            f"Missing ratio-scan catalogue directory: {root}\n"
+            "Run ratio_scan_sample_gen.py first."
         )
 
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
+    paths_by_z: dict[float, list[Path]] = {}
+    for path in root.glob("run*/data_z_*.parquet"):
+        z = _parse_redshift_from_filename(path.name)
+        if z is not None:
+            paths_by_z.setdefault(z, []).append(path)
 
-    rpeak = data.get("R_peak_by_bin", {})
-    if not rpeak:
-        raise ValueError(f"'R_peak_by_bin' is empty in {path}")
+    # Legacy root-level support, without weakening the model-version audit.
+    for path in root.glob("data_z_*.parquet"):
+        z = _parse_redshift_from_filename(path.name)
+        if z is not None:
+            paths_by_z.setdefault(z, []).append(path)
 
-    print(f"[peak ratios] Loaded {len(rpeak)} bins from {filename}")
-    return rpeak
+    if not paths_by_z:
+        raise FileNotFoundError(f"No data_z_*.parquet catalogues found below {root}")
 
+    for paths in paths_by_z.values():
+        paths.sort(key=lambda p: (p.parent.name, p.name))
 
-def _bin_label(lo: float, hi: float) -> str:
-    """Bin key matching the format used by ratio_scan_vcent.py."""
-    return f"[{float(lo):.2f}, {float(hi):.2f}]"
-
-
-def peak_ratio_for_bin(rpeak_table: dict, log_lo: float, log_hi: float,
-                       default: float = 3.0) -> float:
-    """Return the peak kick ratio for a mass bin; `default` is used only if absent."""
-    return float(rpeak_table.get(_bin_label(log_lo, log_hi), default))
-
-
-# ===========================================================================
-# Mass-bin helpers
-# ===========================================================================
-
-def make_mass_bin_edges(logm_min=LOGM_MIN, logm_max=LOGM_MAX, width=BIN_WIDTH):
-    """Return an array of bin edges spanning [logm_min, logm_max] in steps of `width`."""
-    n_steps = int(np.floor((logm_max - logm_min) / width + 0.5))
-    edges   = logm_min + width * np.arange(n_steps + 1)
-    if edges[-1] < logm_max - 1e-9:
-        edges = np.append(edges, logm_max)
-    else:
-        edges[-1] = logm_max
-    return edges
+    return sorted(paths_by_z, reverse=True), paths_by_z
 
 
-def snapshot_file_tag(z: float) -> str:
-    """Filename-safe redshift string for a snapshot, e.g. z = 11.8 → 'z_11_8'."""
-    z_tag = f"{z:.2f}".replace(".", "_")
-    return "z_" + z_tag.rstrip("0").rstrip("_")
-
-
-def _format_mb(path: str) -> str:
-    """Return a file size string in MB, or '?' if the size cannot be read."""
+def _read_catalogue(path: Path, columns: Iterable[str] | None = None) -> pd.DataFrame:
+    """Read one revised catalogue and fail fast on incompatible inputs."""
+    requested = list(columns) if columns is not None else SOURCE_COLUMNS
     try:
-        return f"{os.path.getsize(path) / (1024**2):.2f} MB"
+        df = pd.read_parquet(path, columns=requested)
     except Exception:
-        return "?"
+        # A full read gives a clearer missing-column error for unusual engines.
+        df = pd.read_parquet(path)
 
-
-# ===========================================================================
-# GSMF galaxy count (cached)
-# ===========================================================================
-
-def cached_galaxy_count(z: float, log10M_lo: float, log10M_hi: float,
-                         dz: float = DZ_SLICE):
-    """
-    Expected galaxy count in a stellar-mass bin within a full-sky shell of
-    thickness dz at redshift z. Results are cached to avoid redundant integrals.
-
-    Returns (N_galaxies, n_bin [Mpc^-3], V_shell [Mpc^3]).
-    """
-    z_key     = float(f"{z:.2f}")
-    cache_key = (z_key, float(log10M_lo), float(log10M_hi), float(dz))
-    if cache_key in _gsmf_cache:
-        return _gsmf_cache[cache_key]
-
-    n_bin = gsmf_number_density_in_bin(
-        z_key, log10M_lo, log10M_hi,
-        n_steps=2048, method="pchip", allow_extrapolation=False,
-    )
-    dVc_dz_dOmega = cosmo.differential_comoving_volume(z_key).to(u.Mpc**3 / u.sr)
-    V_shell       = float(dVc_dz_dOmega.value) * dz * OMEGA_FULL
-    result        = (float(n_bin * V_shell), float(n_bin), float(V_shell))
-
-    _gsmf_cache[cache_key] = result
-    return result
-
-
-# ===========================================================================
-# Bin metadata (BH mass windows and peak ratios)
-# ===========================================================================
-
-def build_bin_metadata(active_edges: list, rpeak_table: dict) -> dict:
-    """
-    Precompute per-bin BH mass windows and peak kick ratios.
-
-    For each (log_lo, log_hi) bin, RV15 defines the proposal BH-mass window
-    implied by the stellar-mass bin edges. The peak ratio R_peak is looked up
-    from the ratio-scan JSON.
-
-    Returns a dict keyed by (log_lo, log_hi).
-    """
-    meta  = {}
-    alpha = float(rv15.alpha)
-    beta  = float(rv15.beta)
-    Mpiv  = float(rv15.M_pivot)
-
-    for (log_lo, log_hi) in active_edges:
-        Mstar_lo = 10.0 ** float(log_lo)
-        Mstar_hi = 10.0 ** float(log_hi)
-
-        mbh_lo = 10.0 ** (alpha + beta * np.log10(Mstar_lo / Mpiv))
-        mbh_hi = 10.0 ** (alpha + beta * np.log10(Mstar_hi / Mpiv))
-
-        bh_lo = max(MBH_MIN, min(mbh_lo, mbh_hi))
-        bh_hi = min(MBH_MAX, max(mbh_lo, mbh_hi))
-
-        meta[(float(log_lo), float(log_hi))] = {
-            "bh_lo":   float(bh_lo),
-            "bh_hi":   float(bh_hi),
-            "R_peak":  peak_ratio_for_bin(rpeak_table, log_lo, log_hi),
-        }
-
-    return meta
-
-
-# ===========================================================================
-# Snapshot plan (precomputed once, reused across all runs)
-# ===========================================================================
-
-def precompute_snapshot_plan(z_values: list, active_edges: list) -> list:
-    """
-    For each snapshot, compute expected galaxy counts, physical merger targets,
-    capped sampled targets, and time remaining until z = 6. These depend only
-    on the GSMF and merger rate, so they are computed once and reused across
-    all Monte Carlo runs.
-
-    Returns a list of snapshot plan dicts.
-    """
-    plan = []
-
-    for idx, z_cur in enumerate(z_values):
-        if idx == 0:
-            z_mid  = float(z_cur)
-            t_prev = float(age_of_universe_at_z(Z_EOR_INITIAL))
-            t_curr = float(age_of_universe_at_z(z_cur))
-        else:
-            z_prev = z_values[idx - 1]
-            z_mid  = 0.5 * (z_prev + z_cur)
-            t_prev = float(age_of_universe_at_z(z_prev))
-            t_curr = float(age_of_universe_at_z(z_cur))
-
-        R_Gyr  = float(merger_rate_z(z_mid))
-        dt_Gyr = (t_curr - t_prev) / 1e9
-
-        counts_rows   = []
-        targets_phys  = {}
-        targets_samp  = {}
-        total_N       = 0.0
-        total_mergers = 0.0
-
-        for (lo, hi) in active_edges:
-            N, n_bin, _ = cached_galaxy_count(z_cur, lo, hi, dz=DZ_SLICE)
-            if N < MIN_COUNT:
-                continue
-            mergers_bin = N * R_Gyr * dt_Gyr
-            counts_rows.append((float(lo), float(hi), float(N), float(n_bin),
-                                 float(mergers_bin)))
-            total_N       += float(N)
-            total_mergers += float(mergers_bin)
-
-            n_phys = int(np.round(mergers_bin))
-            if n_phys > 0:
-                n_samp = int(min(n_phys, MAX_EVENTS_PER_BIN))
-                targets_phys[(float(lo), float(hi))] = n_phys
-                targets_samp[(float(lo), float(hi))] = n_samp
-
-        plan.append({
-            "idx":          idx,
-            "z":            float(z_cur),
-            "z_mid":        float(z_mid),
-            "R_Gyr":        R_Gyr,
-            "dt_Gyr":       dt_Gyr,
-            "counts_rows":  counts_rows,
-            "totals":       (total_N, total_mergers),
-            "targets_phys": targets_phys,
-            "targets_samp": targets_samp,
-            "dt_to_z6_yr":  float(time_until_z6(z_cur)),
-        })
-
-    return plan
-
-
-# ===========================================================================
-# Gravitational potential (NFW + Hernquist), dimensionless form
-# ===========================================================================
-
-def _psi_shape(x, Mh_Msun: float, Mb_Msun: float, Re_kpc: float, z: float):
-    """
-    Dimensionless positive potential depth at x = r/Re:
-        psi(x) = Psi(r) / Psi(0),   Psi(r) = -Phi(r),   Psi(0) = 0.5 * Vesc0^2.
-    NFW halo + Hernquist bulge model.
-    """
-    x    = np.asarray(x, dtype=float)
-    Re_m = (Re_kpc * 1000.0) * pc
-    r_m  = x * Re_m
-
-    c        = float(nfw_concentration(Mh_Msun, z))
-    rvir_m   = float(r_vir_mpc(Mh_Msun, z)) * 1.0e6 * pc
-    rs_m     = rvir_m / c
-    f_c      = np.log(1.0 + c) - c / (1.0 + c)
-    Mh_kg    = Mh_Msun * M_sun
-    Mb_kg    = Mb_Msun * M_sun
-    a_m      = Re_m / HERNQUIST_RE_OVER_A
-
-    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-        psi_nfw = G * Mh_kg * np.log(1.0 + r_m / rs_m) / (r_m * f_c)
-    psi_nfw_0 = G * Mh_kg / (rs_m * f_c)
-    psi_nfw   = np.where(r_m > 0.0, psi_nfw, psi_nfw_0)
-
-    psi_h   = G * Mb_kg / (r_m + a_m)
-    psi_h_0 = G * Mb_kg / a_m
-
-    psi0 = psi_nfw_0 + psi_h_0
-    return (psi_nfw + psi_h) / psi0
-
-
-def _find_rmax_bisect(target, Mh_Msun, Mb_Msun, Re_kpc, z, x_lo, x_hi_init):
-    """Find the apocentric x = r/Re where psi(x) = target, by bisection."""
-    x_hi = float(x_hi_init)
-    for _ in range(80):
-        if float(_psi_shape(x_hi, Mh_Msun, Mb_Msun, Re_kpc, z)) < target:
-            break
-        x_hi *= 2.0
-    else:
-        return x_hi
-
-    x_lo = float(x_lo)
-    for _ in range(80):
-        x_mid = 0.5 * (x_lo + x_hi)
-        if float(_psi_shape(x_mid, Mh_Msun, Mb_Msun, Re_kpc, z)) > target:
-            x_lo = x_mid
-        else:
-            x_hi = x_mid
-    return x_hi
-
-
-def _integrate_travel_time(R, Mh_Msun, Mb_Msun, Re_kpc, z,
-                             x0, x1, n=4096, cluster_near_x1=False):
-    """
-    Integrate dx / sqrt(R^2 - 1 + psi(x)) from x0 to x1.
-    The returned value is dimensionless before conversion by the caller.
-    """
-    x0, x1 = float(x0), float(x1)
-    if not (np.isfinite(x0) and np.isfinite(x1) and x1 > x0):
-        return np.nan
-
-    if cluster_near_x1:
-        u  = np.linspace(0.0, 1.0, n, endpoint=False)
-        xs = x0 + (x1 - x0) * (1.0 - (1.0 - u) ** 2)
-    else:
-        xs = np.linspace(x0, x1, n, endpoint=True)
-
-    psi       = _psi_shape(xs, Mh_Msun, Mb_Msun, Re_kpc, z)
-    arg       = np.maximum(R * R - 1.0 + psi, 0.0)
-    denom     = np.sqrt(arg)
-    denom     = np.where(denom > 0.0, denom, np.nan)
-    integrand = 1.0 / denom
-
-    m = np.isfinite(integrand)
-    if m.sum() < 2:
-        return np.nan
-    return float(_TRAPZ(integrand[m], xs[m]))
-
-
-def _representative_orbit_times(rep_Mh, rep_Mb, rep_Re, rep_Vesc0, z, R):
-    """
-    Compute representative orbit travel times for the effective ratio
-    R = V_kick / Vesc0 using the model potential for a given mass bin.
-
-    Returns (t_leave_yr, t_ext_max_yr, t_return_yr, is_bound).
-    """
-    if not all(np.isfinite(v) for v in [rep_Mh, rep_Mb, rep_Re, rep_Vesc0]):
-        return np.nan, 0.0, np.nan, False
-
-    x_nuc = float(F_NUC)
-
-    if R >= 1.0:
-        # Escape-like or unbound trajectory.
-        I_leave = _integrate_travel_time(R, rep_Mh, rep_Mb, rep_Re, z,
-                                          0.0, x_nuc, cluster_near_x1=False)
-        if not np.isfinite(I_leave):
-            return np.nan, 0.0, np.inf, False
-        scale_yr = (rep_Re * KPC_TO_KM / rep_Vesc0) / SEC_PER_YEAR
-        return scale_yr * I_leave, np.inf, np.inf, True
-
-    psi_xnuc = float(_psi_shape(x_nuc, rep_Mh, rep_Mb, rep_Re, z))
-    target   = 1.0 - R * R
-    if psi_xnuc <= target:
-        return np.nan, 0.0, np.nan, False
-
-    try:
-        rvir_kpc = float(r_vir_mpc(rep_Mh, z)) * 1.0e3
-        x_hi0    = max(10.0, rvir_kpc / rep_Re)
-    except Exception:
-        x_hi0 = 1.0e3
-
-    x_max = _find_rmax_bisect(target, rep_Mh, rep_Mb, rep_Re, z,
-                               x_lo=x_nuc, x_hi_init=x_hi0)
-
-    I_leave = _integrate_travel_time(R, rep_Mh, rep_Mb, rep_Re, z,
-                                      0.0, x_nuc, cluster_near_x1=False)
-    I_out   = _integrate_travel_time(R, rep_Mh, rep_Mb, rep_Re, z,
-                                      x_nuc, x_max, cluster_near_x1=True)
-    if not (np.isfinite(I_leave) and np.isfinite(I_out)):
-        return np.nan, 0.0, np.nan, False
-
-    scale_yr  = (rep_Re * KPC_TO_KM / rep_Vesc0) / SEC_PER_YEAR
-    t_leave   = scale_yr * I_leave
-    t_ext_max = scale_yr * (2.0 * I_out)
-    return t_leave, t_ext_max, t_leave + t_ext_max, True
-
-
-def _integral_exp(rate0, t_decay, t0, t1):
-    """
-    Integral of rate0 * exp(-t / t_decay) from t0 to t1 (vectorised).
-    Returns zero where inputs are non-positive or non-finite.
-    """
-    rate0, t_decay, t0, t1 = (np.asarray(x, dtype=float)
-                                for x in (rate0, t_decay, t0, t1))
-    if t0.shape == ():
-        t0 = np.broadcast_to(t0, rate0.shape)
-    if t1.shape == ():
-        t1 = np.broadcast_to(t1, rate0.shape)
-    if t_decay.shape == ():
-        t_decay = np.broadcast_to(t_decay, rate0.shape)
-
-    out = np.zeros_like(rate0, dtype=float)
-    m = (
-        np.isfinite(rate0)  & (rate0  > 0.0) &
-        np.isfinite(t_decay) & (t_decay > 0.0) &
-        np.isfinite(t0) & np.isfinite(t1) & (t1 > t0)
-    )
-    if np.any(m):
-        out[m] = rate0[m] * t_decay[m] * (
-            np.exp(-t0[m] / t_decay[m]) - np.exp(-t1[m] / t_decay[m])
+    missing = sorted(REQUIRED_SOURCE_COLUMNS.difference(df.columns))
+    if missing:
+        raise KeyError(
+            f"Incomplete revised catalogue {path}: missing {missing}. "
+            "Rerun ratio_scan_sample_gen.py with the matching updated files."
         )
+
+    versions = set(df["population_model_version"].dropna().astype(str).unique())
+    if versions != {mps.MODEL_VERSION}:
+        raise RuntimeError(
+            f"Incompatible population model in {path}: found {sorted(versions)}, "
+            f"expected {mps.MODEL_VERSION!r}."
+        )
+
+    classes = set(df["merger_class"].dropna().astype(str).str.lower().unique())
+    if not classes.issubset({mps.MERGER_MAJOR, mps.MERGER_MINOR}):
+        raise RuntimeError(f"Unexpected merger_class values in {path}: {sorted(classes)}")
+
+    return df
+
+
+# ============================================================================
+# Peak-ratio loading
+# ============================================================================
+
+
+def _fcent_tag(value: float) -> str:
+    return f"fcent{value:.2f}".replace(".", "p")
+
+
+def load_peak_ratios(f_nuc: float = F_NUC) -> tuple[dict[str, float], np.ndarray]:
+    """Load and validate the combined major+minor R_peak table."""
+    filename = f"ratio_scan_vcent_rpeak__{_fcent_tag(f_nuc)}.json"
+    path = BASE_DIR / filename
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Peak-ratio JSON not found: {path}\nRun ratio_scan_vcent.py first."
+        )
+
+    with path.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    meta = payload.get("meta", {})
+    if "F_CENT" in meta and not np.isclose(float(meta["F_CENT"]), f_nuc):
+        raise RuntimeError(
+            f"Peak file {filename} has F_CENT={meta['F_CENT']}, expected {f_nuc}."
+        )
+    if meta.get("mass_bin_meaning") not in (None, "descendant galaxy stellar mass"):
+        raise RuntimeError(f"Unexpected mass-bin meaning in {filename}: {meta.get('mass_bin_meaning')}")
+
+    table = payload.get("R_peak_by_bin", {})
+    missing = [label for label in MASS_LABELS if label not in table]
+    if missing:
+        raise RuntimeError(f"Peak table {filename} is missing descendant bins: {missing}")
+
+    values = np.asarray([float(table[label]) for label in MASS_LABELS], dtype=float)
+    if np.any(~np.isfinite(values)) or np.any(values < RATIO_MIN) or np.any(values > RATIO_MAX):
+        raise RuntimeError(f"Invalid R_peak values in {filename}: {values}")
+
+    # Peak values must be ratio-bin centres.  Snapping only removes JSON round-off.
+    nearest = np.argmin(np.abs(values[:, None] - RATIO_CENTERS[None, :]), axis=1)
+    snapped = RATIO_CENTERS[nearest]
+    if not np.allclose(values, snapped, rtol=0.0, atol=1.0e-8):
+        raise RuntimeError(
+            f"R_peak values do not match the ratio-scan bin centres in {filename}."
+        )
+
+    print(f"[peak ratios] Loaded {len(values)} descendant bins from {filename}")
+    return {label: float(value) for label, value in zip(MASS_LABELS, snapped)}, snapped
+
+
+# ============================================================================
+# Descendant-bin helpers
+# ============================================================================
+
+
+def descendant_bin_indices(mstar_msun: np.ndarray) -> np.ndarray:
+    """Vectorised descendant-bin assignment, including the exact final edge."""
+    mstar = np.asarray(mstar_msun, dtype=float)
+    logm = np.log10(mstar, where=(mstar > 0.0), out=np.full_like(mstar, np.nan))
+    idx = np.searchsorted(MASS_EDGES, logm, side="right") - 1
+    idx[np.isclose(logm, MASS_EDGES[-1], rtol=0.0, atol=1.0e-10)] = N_MASS - 1
+    return idx.astype(np.int16, copy=False)
+
+
+# ============================================================================
+# Representative potential and orbit calculations
+# These functions reproduce the updated ratio_scan_vcent.py implementation.
+# ============================================================================
+
+G_KPC = 4.30091e-6  # (km/s)^2 kpc / Msun
+
+
+def psi_total_scaled_factory(rep_mstar: float, rep_re_kpc: float,
+                             rep_vesc0_kms: float, z: float):
+    """Return the positive NFW+Hernquist potential scaled to catalogue Vesc0."""
+    mh = float(pr.fire2_mh_from_mstar(rep_mstar))
+    mb = float(F_BULGE * rep_mstar)
+
+    rvir_kpc = float(pr.r_vir_mpc(mh, z) * 1.0e3)
+    concentration = float(pr.nfw_concentration(mh, z))
+    f_c = math.log(1.0 + concentration) - concentration / (1.0 + concentration)
+    rs = rvir_kpc / concentration
+    a = rep_re_kpc / HERNQUIST_RE_OVER_A
+
+    def psi_nfw(r_kpc):
+        r = np.asarray(r_kpc, dtype=float)
+        term = np.empty_like(r)
+        positive = r > 0.0
+        term[positive] = np.log1p(r[positive] / rs) / r[positive]
+        term[~positive] = 1.0 / rs
+        return (G_KPC * mh / f_c) * term
+
+    def psi_hernquist(r_kpc):
+        r = np.asarray(r_kpc, dtype=float)
+        return (G_KPC * mb) / (r + a)
+
+    psi0_model = float(psi_nfw(0.0) + psi_hernquist(0.0))
+    psi0_target = 0.5 * rep_vesc0_kms**2
+    scale = 1.0 if (not np.isfinite(psi0_model) or psi0_model <= 0.0) \
+        else psi0_target / psi0_model
+
+    def psi(r_kpc):
+        return scale * (psi_nfw(r_kpc) + psi_hernquist(r_kpc))
+
+    return psi, rvir_kpc
+
+
+def travel_time_years(psi, psi_target: float, r1_kpc: float,
+                      r2_kpc: float, n: int = N_INT) -> float:
+    """Integrate dt=dr/sqrt(2(Psi-psi_target)) using midpoint cells."""
+    if r2_kpc <= r1_kpc:
+        return 0.0
+
+    edges = np.linspace(r1_kpc, r2_kpc, int(n) + 1)
+    mids = 0.5 * (edges[:-1] + edges[1:])
+    dr = np.diff(edges)
+    diff = psi(mids) - psi_target
+    if not np.all(np.isfinite(diff)) or np.any(diff <= 0.0):
+        return np.nan
+
+    velocity = np.sqrt(2.0 * diff)
+    dt_seconds = (dr / velocity) * KPC_TO_KM
+    value = np.sum(dt_seconds) / SEC_PER_YEAR
+    return float(value) if np.isfinite(value) else np.nan
+
+
+def find_rmax_bisect(psi, psi_target: float, r_lo: float,
+                     r_hi: float) -> float | None:
+    """Find the radial turning point Psi(r)=psi_target by bisection."""
+    f_lo = float(psi(r_lo) - psi_target)
+    f_hi = float(psi(r_hi) - psi_target)
+    if not (np.isfinite(f_lo) and np.isfinite(f_hi)) or f_lo <= 0.0 or f_hi >= 0.0:
+        return None
+
+    a, b = float(r_lo), float(r_hi)
+    for _ in range(70):
+        mid = 0.5 * (a + b)
+        f_mid = float(psi(mid) - psi_target)
+        if not np.isfinite(f_mid):
+            return None
+        if f_mid > 0.0:
+            a = mid
+        else:
+            b = mid
+    return 0.5 * (a + b)
+
+
+def build_selected_rep_data(df: pd.DataFrame, z: float,
+                            rpeak_by_bin: np.ndarray) -> tuple[np.ndarray, ...]:
+    """Build representative orbit quantities only at the selected R_peak values."""
+    rep_t_leave = np.full(N_MASS, np.nan, dtype=float)
+    rep_t_ext_max = np.full(N_MASS, np.nan, dtype=float)
+    rep_scale_base = np.full(N_MASS, np.nan, dtype=float)
+    rep_vcent_over_vesc0 = np.full(N_MASS, np.nan, dtype=float)
+
+    mstar = pd.to_numeric(df["Mstar_rem_Msun"], errors="coerce").to_numpy(float)
+    re_kpc = pd.to_numeric(df["Re_kpc"], errors="coerce").to_numpy(float)
+    vesc0 = pd.to_numeric(df["Vesc0_kms"], errors="coerce").to_numpy(float)
+    mass_i = descendant_bin_indices(mstar)
+
+    for mass_bin in range(N_MASS):
+        selected = (
+            (mass_i == mass_bin)
+            & np.isfinite(mstar) & (mstar > 0.0)
+            & np.isfinite(re_kpc) & (re_kpc > 0.0)
+            & np.isfinite(vesc0) & (vesc0 > 0.0)
+        )
+        if not np.any(selected):
+            continue
+
+        rep_mstar = float(np.nanmedian(mstar[selected]))
+        rep_re = float(np.nanmedian(re_kpc[selected]))
+        rep_vesc = float(np.nanmedian(vesc0[selected]))
+        if not (rep_mstar > 0.0 and rep_re > 0.0 and rep_vesc > 0.0):
+            continue
+
+        rep_scale_base[mass_bin] = rep_re / rep_vesc
+        psi, rvir_kpc = psi_total_scaled_factory(rep_mstar, rep_re, rep_vesc, z)
+        r_cent = F_NUC * rep_re
+        psi0 = 0.5 * rep_vesc**2
+        psi_rcent = float(psi(r_cent))
+
+        if np.isfinite(psi_rcent) and psi0 > 0.0 and psi_rcent < psi0:
+            vcent_ratio = math.sqrt(max(0.0, 1.0 - psi_rcent / psi0))
+        else:
+            vcent_ratio = 1.0
+        rep_vcent_over_vesc0[mass_bin] = vcent_ratio
+
+        ratio = float(rpeak_by_bin[mass_bin])
+        effective_ratio = ratio * vcent_ratio
+        psi_target = psi0 * (1.0 - effective_ratio**2)
+        if not np.isfinite(psi_rcent) or psi_rcent <= psi_target:
+            continue
+
+        t_leave = travel_time_years(psi, psi_target, 0.0, r_cent)
+        if not (np.isfinite(t_leave) and t_leave > 0.0):
+            continue
+        rep_t_leave[mass_bin] = t_leave
+
+        # psi_target <= 0 is escape-like: the external phase lasts until z=6.
+        if psi_target <= 0.0:
+            continue
+
+        r_hi = min(max(2.0 * r_cent, 1.2 * r_cent), rvir_kpc)
+        psi_hi = float(psi(r_hi))
+        tries = 0
+        while (np.isfinite(psi_hi) and psi_hi > psi_target
+               and r_hi < rvir_kpc and tries < 25):
+            r_hi = min(r_hi * 1.6, rvir_kpc)
+            psi_hi = float(psi(r_hi))
+            tries += 1
+
+        if not (np.isfinite(psi_hi) and psi_hi < psi_target):
+            continue
+
+        rmax = find_rmax_bisect(psi, psi_target, r_cent, r_hi)
+        if rmax is None or not (np.isfinite(rmax) and rmax > r_cent):
+            continue
+
+        t_half = travel_time_years(psi, psi_target, r_cent, rmax)
+        if np.isfinite(t_half) and t_half > 0.0:
+            rep_t_ext_max[mass_bin] = 2.0 * t_half
+
+    return rep_t_leave, rep_t_ext_max, rep_scale_base, rep_vcent_over_vesc0
+
+
+def representative_data_for_snapshot(paths: list[Path], z: float,
+                                     rpeak_by_bin: np.ndarray) -> tuple[np.ndarray, ...]:
+    """Reproduce the ratio scan's first-valid-run representative-bin policy."""
+    combined = (
+        np.full(N_MASS, np.nan, dtype=float),
+        np.full(N_MASS, np.nan, dtype=float),
+        np.full(N_MASS, np.nan, dtype=float),
+        np.full(N_MASS, np.nan, dtype=float),
+    )
+    rep_t_leave, rep_t_ext_max, rep_scale, rep_vcent = combined
+
+    minimal = [
+        "population_model_version", "merger_class",
+        "Mstar_rem_Msun", "Mrem_BH_Msun", "Re_kpc",
+        "log10_Mh_fire2", "Vesc0_kms", "weight",
+    ]
+
+    for path in paths:
+        df = _read_catalogue(path, columns=minimal)
+        if df.empty:
+            continue
+
+        mstar = pd.to_numeric(df["Mstar_rem_Msun"], errors="coerce").to_numpy(float)
+        present = np.unique(descendant_bin_indices(mstar))
+        present = present[(present >= 0) & (present < N_MASS)]
+        missing = [int(idx) for idx in present if not np.isfinite(rep_scale[int(idx)])]
+        if not missing:
+            continue
+
+        cand_leave, cand_ext, cand_scale, cand_vcent = build_selected_rep_data(
+            df, z, rpeak_by_bin
+        )
+        for idx in missing:
+            if np.isfinite(cand_scale[idx]):
+                rep_t_leave[idx] = cand_leave[idx]
+                rep_t_ext_max[idx] = cand_ext[idx]
+                rep_scale[idx] = cand_scale[idx]
+                rep_vcent[idx] = cand_vcent[idx]
+
+    return combined
+
+
+# ============================================================================
+# Vectorised kick and TDE calculations
+# ============================================================================
+
+
+def _integral_exp(rate_yr, t_decay_yr, t0, t1) -> np.ndarray:
+    """Integrate rate*exp(-t/t_decay) over [t0,t1] with broadcasting."""
+    rate, decay, start, end = np.broadcast_arrays(
+        np.asarray(rate_yr, dtype=float),
+        np.asarray(t_decay_yr, dtype=float),
+        np.asarray(t0, dtype=float),
+        np.asarray(t1, dtype=float),
+    )
+    out = np.zeros_like(rate, dtype=float)
+    valid = (
+        np.isfinite(rate) & (rate > 0.0)
+        & np.isfinite(decay) & (decay > 0.0)
+        & np.isfinite(start) & np.isfinite(end) & (end > start)
+    )
+    if np.any(valid):
+        x0 = np.clip(start[valid] / decay[valid], 0.0, 1.0e6)
+        x1 = np.clip(end[valid] / decay[valid], 0.0, 1.0e6)
+        values = rate[valid] * decay[valid] * (np.exp(-x0) - np.exp(-x1))
+        out[valid] = np.where(np.isfinite(values) & (values > 0.0), values, 0.0)
     return out
 
 
-# ===========================================================================
-# Kick assignment from V_cent peak ratios
-# ===========================================================================
-
-def assign_kicks(df: pd.DataFrame, z: float, rpeak_table: dict) -> pd.DataFrame:
-    """
-    Assign a GW recoil kick to each remnant using the per-bin peak ratio
-        R_peak = V_kick / V_cent,
-    where V_cent is estimated from a representative potential for each
-    (z, mass-bin) group and individual values are scaled using each remnant's
-    Vesc0:
-        V_cent(BH) ~= (V_cent / Vesc0)_rep * Vesc0(BH).
-
-    Adds / overwrites columns: v_cent_kms, Vkick_kms, Vkick_over_Vesc0,
-    Vkick_over_Vcent, escaped.
-    """
-    if df is None or len(df) == 0:
+def attach_kicks_and_tdes(df: pd.DataFrame, z: float, dt_to_z6_yr: float,
+                          rpeak_by_bin: np.ndarray,
+                          rep_data: tuple[np.ndarray, ...]) -> pd.DataFrame:
+    """Attach kicks, orbit times, and TDE counts without changing the model."""
+    if df.empty:
         return df
 
-    bin_lo = np.round(df["bin_lo_log10M"].to_numpy(float), 2)
-    bin_hi = np.round(df["bin_hi_log10M"].to_numpy(float), 2)
-    uniq_pairs, inv = np.unique(np.stack([bin_lo, bin_hi], axis=1),
-                                 axis=0, return_inverse=True)
-    n_bins = uniq_pairs.shape[0]
+    rep_t_leave, rep_t_ext_max, rep_scale_base, rep_vcent_ratio = rep_data
 
-    Re_kpc   = df["Re_kpc"].to_numpy(float)
-    Vesc0    = df["Vesc0_kms"].to_numpy(float)
-    log10_Mh = df["log10_Mh_fire2"].to_numpy(float)
-    Mstar    = df["Mstar_rem_Msun"].to_numpy(float)
-    Rpeak_v  = df["Rpeak_vcent"].to_numpy(float)
+    mstar = pd.to_numeric(df["Mstar_rem_Msun"], errors="coerce").to_numpy(float)
+    mbh = pd.to_numeric(df["Mrem_BH_Msun"], errors="coerce").to_numpy(float)
+    re_kpc = pd.to_numeric(df["Re_kpc"], errors="coerce").to_numpy(float)
+    vesc0 = pd.to_numeric(df["Vesc0_kms"], errors="coerce").to_numpy(float)
+    mass_i = descendant_bin_indices(mstar).astype(int)
 
-    vcent_over_vesc0 = np.ones(n_bins, dtype=float)
+    valid_bins = (mass_i >= 0) & (mass_i < N_MASS)
+    if not np.all(valid_bins):
+        bad = int(np.count_nonzero(~valid_bins))
+        raise RuntimeError(f"{bad} catalogue rows fall outside the shared descendant bins.")
 
-    for j in range(n_bins):
-        bin_mask = (inv == j)
-        if not np.any(bin_mask):
-            continue
+    missing_rep = np.unique(mass_i[~np.isfinite(rep_scale_base[mass_i])])
+    if len(missing_rep):
+        labels = [MASS_LABELS[int(i)] for i in missing_rep]
+        raise RuntimeError(f"Missing representative host potentials for bins {labels} at z={z:.2f}")
 
-        rep_Re   = float(np.nanmedian(Re_kpc[bin_mask]))
-        rep_Vesc = float(np.nanmedian(Vesc0[bin_mask]))
-        rep_Mh   = float(np.nanmedian(10.0 ** log10_Mh[bin_mask]))
-        rep_Mb   = float(F_BULGE * np.nanmedian(Mstar[bin_mask]))
+    ratio = rpeak_by_bin[mass_i]
+    vcent_ratio = rep_vcent_ratio[mass_i]
+    vcent_ratio = np.where(np.isfinite(vcent_ratio) & (vcent_ratio > 0.0),
+                            vcent_ratio, 1.0)
 
-        # Estimate V_cent/Vesc0 from the median host potential in each active bin.
-        psi_xnuc = float(_psi_shape(F_NUC, rep_Mh, rep_Mb, rep_Re, z))
-        if not np.isfinite(psi_xnuc):
-            vcent_over_vesc0[j] = 1.0
-        else:
-            psi_xnuc = float(np.clip(psi_xnuc, 0.0, 1.0))
-            vcent_over_vesc0[j] = math.sqrt(max(0.0, 1.0 - psi_xnuc))
-
-    vcent_row = vcent_over_vesc0[inv] * Vesc0
-    Vkick     = Rpeak_v * vcent_row
+    vcent = vcent_ratio * vesc0
+    # Preserve the multiplication order used by ratio_scan_vcent.py.
+    vkick = ratio * vcent_ratio * vesc0
+    vkick = np.where(np.isfinite(vkick) & (vkick > 0.0), vkick, 0.0)
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        Vk_over_vesc0 = Vkick / Vesc0
-        Vk_over_vcent = Vkick / vcent_row
+        vkick_over_vesc = vkick / vesc0
+        vkick_over_vcent = vkick / vcent
 
-    df["v_cent_kms"]       = vcent_row
-    df["Vkick_kms"]        = Vkick
-    df["Vkick_over_Vesc0"] = Vk_over_vesc0
-    df["Vkick_over_Vcent"] = Vk_over_vcent
-    df["escaped"]          = (Vkick >= Vesc0)
-    return df
+    df["Rpeak_vcent"] = ratio
+    df["v_cent_kms"] = vcent
+    df["Vkick_kms"] = vkick
+    df["Vkick_over_Vesc0"] = vkick_over_vesc
+    df["Vkick_over_Vcent"] = vkick_over_vcent
+    df["escaped"] = vkick >= vesc0
 
+    mbh_si = mbh * pr.M_sun
+    v_k_ms = vkick * pr.km
 
-# ===========================================================================
-# Event drawing (rejection sampling)
-# ===========================================================================
-
-def draw_merger_event(log_lo: float, log_hi: float, z: float, rng,
-                       bin_meta: dict, rpeak_table: dict):
-    """
-    Draw one BH–BH merger remnant landing in the host bin [log_lo, log_hi).
-
-    Procedure:
-      1. Draw the heavier component m2 log-uniformly in the bin's BH window.
-      2. Draw the lighter component m1 log-uniformly in [MBH_MIN, m2].
-      3. Compute remnant mass with the JF2017 non-spinning fit.
-      4. Invert RV15 to get host-galaxy stellar mass; reject if outside the bin.
-      5. Compute Re, M_h, and Vesc0.
-
-    Returns a tuple on success, None if any step fails or the event falls
-    outside the target stellar-mass bin.
-    """
-    info = bin_meta.get((log_lo, log_hi))
-    if info is None:
-        return None
-
-    bh_lo = info["bh_lo"]
-    bh_hi = info["bh_hi"]
-    if not (np.isfinite(bh_lo) and np.isfinite(bh_hi) and bh_hi > bh_lo):
-        return None
-
-    m2 = 10.0 ** rng.uniform(np.log10(bh_lo), np.log10(bh_hi))
-    if not (np.isfinite(m2) and m2 > 0.0):
-        return None
-
-    log10_m2 = float(np.log10(m2))
-    if log10_m2 <= _LOG10_MBH_MIN:
-        return None
-    m1 = 10.0 ** rng.uniform(_LOG10_MBH_MIN, log10_m2)
-    if not (np.isfinite(m1) and m1 > 0.0):
-        return None
-
-    if m1 > m2:
-        m1, m2 = m2, m1
-
-    Mrem, _ = final_mass_and_fraction_ns_jf2017(float(m1), float(m2))
-    if not (np.isfinite(Mrem) and Mrem > 0.0):
-        return None
-    Mrem = min(Mrem, MBH_POST_MAX)
-
-    Mstar = mstar_from_mbh(float(Mrem))
-    if not (np.isfinite(Mstar) and Mstar > 0.0):
-        return None
-    if not (log_lo <= np.log10(Mstar) < log_hi):
-        return None
-
-    Re = re_kpc_m24(float(Mstar), float(z))
-    if not (np.isfinite(Re) and Re > 0.0):
-        return None
-
-    log10_Mh = fire2_log10_mh_from_mstar(float(Mstar), fire2_params)
-    if not np.isfinite(log10_Mh):
-        return None
-    Mh    = 10.0 ** float(log10_Mh)
-    Mb    = F_BULGE * float(Mstar)
-    Vesc0 = vesc0_nfw_hernquist(float(Mh), float(Mb), float(Re), float(z))
-    if not (np.isfinite(Vesc0) and Vesc0 > 0.0):
-        return None
-
-    q       = float(m1 / m2)
-    R_peak  = float(info["R_peak"])
-
-    return (float(log_lo), float(log_hi), float(z),
-            float(m1), float(m2), float(q),
-            float(Mrem), float(Mstar),
-            float(Re), float(log10_Mh),
-            float(Vesc0), float(R_peak))
-
-
-def sample_snapshot_events(targets_phys: dict, targets_samp: dict,
-                             z: float, rng, bin_meta: dict,
-                             rpeak_table: dict) -> tuple[pd.DataFrame, dict]:
-    """
-    Fill all bins to their capped sampled targets by rejection sampling.
-
-    Events in bins where the physical count exceeds the sampling cap are
-    assigned a per-row weight (n_phys / n_samp) so that the scaled totals
-    still represent the physical population.
-
-    Physical and sampled counts are tracked in the summary. Placeholder kick
-    columns are filled by assign_kicks().
-
-    Returns (df_events, summary_dict).
-    """
-    cols = {k: [] for k in [
-        "bin_lo_log10M", "bin_hi_log10M", "z",
-        "m1_BH_Msun", "m2_BH_Msun", "q",
-        "Mrem_BH_Msun", "Mstar_rem_Msun",
-        "Re_kpc", "log10_Mh_fire2",
-        "Vesc0_kms", "Rpeak_vcent",
-    ]}
-
-    summary = {}
-
-    for (lo, hi) in sorted(targets_samp.keys()):
-        n_phys = int(targets_phys.get((lo, hi), 0))
-        n_goal = int(targets_samp[(lo, hi)])
-        if n_goal <= 0:
-            continue
-
-        filled    = 0
-        tries     = 0
-        max_tries = min(MAX_TRIES_PER_BIN,
-                        max(10_000, MAX_TRIES_MULTIPLIER * n_goal))
-
-        while filled < n_goal and tries < max_tries:
-            tries += 1
-            out = draw_merger_event(lo, hi, z, rng, bin_meta, rpeak_table)
-            if out is None:
-                continue
-
-            (b_lo, b_hi, zc, m1, m2, q, Mrem, Mstar,
-             Re, log10_Mh, Vesc0, R_peak) = out
-
-            cols["bin_lo_log10M"].append(b_lo)
-            cols["bin_hi_log10M"].append(b_hi)
-            cols["z"].append(zc)
-            cols["m1_BH_Msun"].append(m1)
-            cols["m2_BH_Msun"].append(m2)
-            cols["q"].append(q)
-            cols["Mrem_BH_Msun"].append(Mrem)
-            cols["Mstar_rem_Msun"].append(Mstar)
-            cols["Re_kpc"].append(Re)
-            cols["log10_Mh_fire2"].append(log10_Mh)
-            cols["Vesc0_kms"].append(Vesc0)
-            cols["Rpeak_vcent"].append(R_peak)
-            filled += 1
-
-        summary[(lo, hi)] = {
-            "target_phys": n_phys,
-            "target_samp": n_goal,
-            "filled":      filled,
-            "tries":       tries,
-            "cap_applied": (n_phys > n_goal),
-        }
-
-    df = pd.DataFrame(cols)
-
-    # Placeholder kick columns — filled by assign_kicks()
-    df["v_cent_kms"]       = np.nan
-    df["Vkick_kms"]        = np.nan
-    df["Vkick_over_Vesc0"] = np.nan
-    df["Vkick_over_Vcent"] = np.nan
-    df["escaped"]          = False
-
-    return df, summary
-
-
-# ===========================================================================
-# TDE field attachment
-# ===========================================================================
-
-def attach_tde_fields(df: pd.DataFrame, z: float, dt_to_z6_yr: float) -> pd.DataFrame:
-    """
-    Attach TDE rates and integrated TDE counts to every remnant.
-
-    For each remnant the procedure is:
-      1. Compute the resonant-relaxation TDE rate (Merritt+2009).
-      2. Determine the orbit travel time to/from the central-region boundary using
-         representative (median) galaxy properties per mass bin.
-      3. Integrate an exponentially decaying rate over three time segments:
-           a. Central phase before boundary crossing.
-           b. External phase outside the central region.
-           c. Central phase after the BH returns (bound orbits only).
-
-    Only TDEs accumulated during the external phase (b) contribute to
-    IGM ionising budget.
-
-    Adds columns: t_esc_yr, t_external_yr, tde_rate_per_yr,
-                  tde_nuclear_preescape, tde_external_post, tde_count_per_bh.
-    """
-    if len(df) == 0:
-        return df
-
-    M_star_SI = 1.0 * M_sun
-    R_sun_m   = 6.957e8
-
-    Mbh_Msun   = df["Mrem_BH_Msun"].to_numpy(float)
-    Re_kpc_arr = df["Re_kpc"].to_numpy(float)
-    Vesc0_kms  = df["Vesc0_kms"].to_numpy(float)
-    Vkick_kms  = df["Vkick_kms"].to_numpy(float)
-    Mstar_Msun = df["Mstar_rem_Msun"].to_numpy(float)
-    log10_Mh   = df["log10_Mh_fire2"].to_numpy(float)
-
-    Mbh_SI  = Mbh_Msun * M_sun
-    v_k_ms  = Vkick_kms * km
-
-    # TDE rate (Merritt+2009)
-    rk_val       = r_k(Mbh_SI, v_k_ms)
-    sigma_km_s, _ = sigma_from_mbh(Mbh_SI)
-    r_eff_pc     = pr.r_eff_from_rk_gamma1(rk_val) / pc
-    Mb_coll_kg   = m_b_collisional(Mbh_Msun, sigma_km_s, r_eff_pc)
-    cap_stars    = np.where(np.isfinite(Mb_coll_kg) & (Mb_coll_kg > 0.0),
-                            Mb_coll_kg / M_sun, 0.0)
-
-    f_b     = np.clip(f_b_from_mb(Mb_coll_kg, Mbh_SI), 0.0, 1.0)
-    rt_val  = r_t(Mbh_SI, M_star_SI, R_sun_m)
-    rate_s  = tde_rate_resonant(Mbh_SI, M_star_SI, rk_val, rt_val, v_k_ms, f_b)
-    rate_yr = np.where(np.isfinite(rate_s) & (rate_s > 0.0),
-                       rate_s * SEC_PER_YEAR, 0.0)
-
-    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-        t_decay_yr = 1.5e9 * (Mbh_Msun / 1.0e7) ** 2 * (Vkick_kms / 1.0e3) ** (-3.0)
-    t_decay_yr = np.where(np.isfinite(t_decay_yr) & (t_decay_yr > 0.0),
-                          t_decay_yr, np.nan)
-
-    t_cap = float(dt_to_z6_yr) if (np.isfinite(dt_to_z6_yr) and dt_to_z6_yr > 0.0) else 0.0
-
-    # Representative orbit times per mass bin (Re/Vesc0 scaling per galaxy)
-    bin_lo = np.round(df["bin_lo_log10M"].to_numpy(float), 2)
-    bin_hi = np.round(df["bin_hi_log10M"].to_numpy(float), 2)
-    uniq_pairs, inv = np.unique(np.stack([bin_lo, bin_hi], axis=1),
-                                 axis=0, return_inverse=True)
-    n_bins = uniq_pairs.shape[0]
-
-    rep_scale_base = np.full(n_bins, np.nan, float)
-    rep_t_leave    = np.full(n_bins, np.nan, float)
-    rep_t_ext_max  = np.zeros(n_bins, float)
-    rep_leave_ok   = np.zeros(n_bins, bool)
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        Vkick_over_Vesc0 = Vkick_kms / Vesc0_kms
-
-    for j in range(n_bins):
-        lo, hi = float(uniq_pairs[j, 0]), float(uniq_pairs[j, 1])
-        bin_mask = (inv == j)
-        if not np.any(bin_mask):
-            continue
-
-        rep_Re   = float(np.nanmedian(Re_kpc_arr[bin_mask]))
-        rep_Vesc = float(np.nanmedian(Vesc0_kms[bin_mask]))
-        rep_Mh   = float(np.nanmedian(10.0 ** log10_Mh[bin_mask]))
-        rep_Mb   = float(F_BULGE * np.nanmedian(Mstar_Msun[bin_mask]))
-
-        # Convert the V_cent peak ratio to an effective Vkick/Vesc0 ratio for
-        # the orbit-time calculation (R_eff = R_peak * (Vcent/Vesc0)_rep).
-        R_peak   = peak_ratio_for_bin({}, lo, hi)  # not needed here; use Vkick_over_Vesc0
-        psi_xnuc = float(_psi_shape(F_NUC, rep_Mh, rep_Mb, rep_Re, z))
-        psi_xnuc = float(np.clip(psi_xnuc, 0.0, 1.0)) if np.isfinite(psi_xnuc) else 0.0
-        vcent_over_vesc0_rep = math.sqrt(max(0.0, 1.0 - psi_xnuc))
-
-        # Median Vkick / Vesc0 across the bin's events
-        R_eff = float(np.nanmedian(Vkick_over_Vesc0[bin_mask]))
-
-        tL, t_ext_max_rep, _tRet, ok = _representative_orbit_times(
-            rep_Mh, rep_Mb, rep_Re, rep_Vesc, z, R_eff
-        )
-
-        rep_scale_base[j] = (rep_Re / rep_Vesc) if (rep_Re > 0 and rep_Vesc > 0) else np.nan
-        rep_t_leave[j]    = float(tL)
-        rep_t_ext_max[j]  = float(t_ext_max_rep)
-        rep_leave_ok[j]   = bool(ok)
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        base_i    = Re_kpc_arr / Vesc0_kms
-        scale_fac = base_i / rep_scale_base[inv]
-    scale_fac = np.where(np.isfinite(scale_fac) & (scale_fac > 0.0), scale_fac, 1.0)
-
-    leave_ok  = rep_leave_ok[inv]
-    t_leave   = rep_t_leave[inv]   * scale_fac
-    t_ext_max = rep_t_ext_max[inv] * scale_fac
-    t_leave   = np.where(leave_ok, t_leave, np.nan)
-    t_ext_max = np.where(leave_ok, t_ext_max, 0.0)
-
-    is_bound = (Vkick_over_Vesc0 < 1.0)
-    rem_after_leave = np.where(
-        leave_ok & np.isfinite(t_leave),
-        np.clip(t_cap - t_leave, 0.0, None), 0.0
+    # Ratio-invariant row factors, matching the optimised ratio scan.
+    sigma_km_s, _ = pr.sigma_from_mbh(mbh_si)
+    rt = pr.r_t(mbh_si, M_STAR_SI, R_STAR_SI)
+    mb_coll_prefactor_msun = (
+        4.0e4
+        * (mbh / 1.0e7) ** (-0.25)
+        * (sigma_km_s / 100.0) ** 2.5
     )
-    t_ext = np.where(
-        leave_ok,
-        np.where(is_bound, np.minimum(rem_after_leave, t_ext_max), rem_after_leave),
+    ln_lambda = np.log(mbh_si / M_STAR_SI)
+
+    rk = pr.r_k(mbh_si, v_k_ms)
+    r_eff_pc = pr.r_eff_from_rk_gamma1(rk) / pr.pc
+    mb_coll_kg = (
+        mb_coll_prefactor_msun * (r_eff_pc / 0.1) ** 1.25
+    ) * pr.M_sun
+    cap_stars = np.where(
+        np.isfinite(mb_coll_kg) & (mb_coll_kg > 0.0),
+        mb_coll_kg / M_STAR_SI,
+        0.0,
+    )
+    f_b_raw = mb_coll_kg / mbh_si
+    f_b = np.clip(np.where(np.isfinite(f_b_raw), f_b_raw, 0.0), 0.0, 1.0)
+
+    rk_arr = np.asarray(rk, dtype=float)
+    ln_ratio = np.where(rk_arr > rt, np.log(rk_arr / rt), np.inf)
+    rate_s = (ln_lambda / ln_ratio) * (v_k_ms / rk_arr) * f_b
+    rate_yr = np.where(
+        np.isfinite(rate_s) & (rate_s > 0.0), rate_s * SEC_PER_YEAR, 0.0
+    )
+
+    t_decay_mass_prefactor = 1.5e9 * (mbh / 1.0e7) ** 2
+    if TDECAY_MODE == "vkick":
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            t_decay_yr = t_decay_mass_prefactor * (vkick / 1.0e3) ** (-3.0)
+        t_decay_yr = np.where(
+            (vkick <= 0.0) & np.isfinite(mbh), TDECAY_NO_DECAY_YR, t_decay_yr
+        )
+    elif TDECAY_MODE == "mass_only":
+        t_decay_yr = t_decay_mass_prefactor
+    else:
+        raise ValueError(f"Unknown TDECAY_MODE: {TDECAY_MODE}")
+    t_decay_yr = np.where(
+        np.isfinite(t_decay_yr) & (t_decay_yr > 0.0), t_decay_yr, 0.0
+    )
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        scale = (re_kpc / vesc0) / rep_scale_base[mass_i]
+    scale = np.where(np.isfinite(scale) & (scale > 0.0), scale, 1.0)
+
+    t_leave = rep_t_leave[mass_i] * scale
+    t_leave = np.where(np.isfinite(t_leave) & (t_leave > 0.0), t_leave, np.nan)
+    t_ext_max = rep_t_ext_max[mass_i] * scale
+
+    t_cap = float(dt_to_z6_yr) if np.isfinite(dt_to_z6_yr) and dt_to_z6_yr > 0.0 else 0.0
+    active = np.isfinite(t_leave) & (t_leave < t_cap)
+    remaining_time = np.where(active, np.maximum(0.0, t_cap - t_leave), 0.0)
+
+    # Same convention as the ratio scan: NaN t_ext_max denotes escape-like motion.
+    t_external = np.where(
+        active,
+        np.where(
+            np.isfinite(t_ext_max) & (t_ext_max > 0.0),
+            np.minimum(t_ext_max, remaining_time),
+            remaining_time,
+        ),
         0.0,
     )
 
-    # --- Integrate the exponentially decaying TDE rate over each time segment. ---
-    t_nuc_pre = np.where(
-        leave_ok & np.isfinite(t_leave),
-        np.minimum(t_leave, t_cap), t_cap,
+    t_nuclear_pre = np.where(active, t_leave, t_cap)
+    n_nuclear_pre_unc = _integral_exp(rate_yr, t_decay_yr, 0.0, t_nuclear_pre)
+    n_external_unc = _integral_exp(
+        rate_yr,
+        t_decay_yr,
+        np.where(active, t_leave, 0.0),
+        np.where(active, t_leave + t_external, 0.0),
     )
-    N_nuc_pre_unc = _integral_exp(rate_yr, t_decay_yr, 0.0, t_nuc_pre)
 
-    t0_ext    = np.where(np.isfinite(t_leave), t_leave, 0.0)
-    N_ext_unc = _integral_exp(rate_yr, t_decay_yr, t0_ext, t0_ext + t_ext)
+    n_nuclear_pre = np.minimum(n_nuclear_pre_unc, cap_stars)
+    cap_after_pre = np.maximum(0.0, cap_stars - n_nuclear_pre)
+    n_external = np.minimum(n_external_unc, cap_after_pre)
 
-    t_return     = np.where(leave_ok & np.isfinite(t_leave), t_leave + t_ext_max, np.nan)
-    t_nuc_post   = np.where(
-        leave_ok & is_bound & np.isfinite(t_return),
-        np.clip(t_cap - t_return, 0.0, None), 0.0,
+    is_bound = vkick_over_vesc < 1.0
+    t_return = t_leave + t_ext_max
+    post_duration = np.where(
+        active & is_bound & np.isfinite(t_ext_max) & np.isfinite(t_return),
+        np.maximum(0.0, t_cap - t_return),
+        0.0,
     )
-    t0_nuc_post    = np.clip(t_cap - t_nuc_post, 0.0, None)
-    N_nuc_post_unc = _integral_exp(rate_yr, t_decay_yr, t0_nuc_post, t_cap)
+    post_start = np.maximum(0.0, t_cap - post_duration)
+    n_nuclear_post_unc = _integral_exp(rate_yr, t_decay_yr, post_start, t_cap)
+    cap_after_external = np.maximum(0.0, cap_after_pre - n_external)
+    n_nuclear_post = np.minimum(n_nuclear_post_unc, cap_after_external)
 
-    # Apply the bound-star cap sequentially across central, external, and return segments.
-    N_nuc_pre  = np.minimum(N_nuc_pre_unc, cap_stars)
-    cap_rem    = np.clip(cap_stars - N_nuc_pre, 0.0, None)
-    N_ext      = np.minimum(N_ext_unc, cap_rem)
-    cap_rem2   = np.clip(cap_rem - N_ext, 0.0, None)
-    N_nuc_post = np.minimum(N_nuc_post_unc, cap_rem2)
-
-    df["t_esc_yr"]              = t_leave
-    df["t_external_yr"]         = t_ext
-    df["tde_rate_per_yr"]       = rate_yr
-    df["tde_nuclear_preescape"] = N_nuc_pre + N_nuc_post
-    df["tde_external_post"]     = N_ext
-    df["tde_count_per_bh"]      = N_ext
-
-    # Diagnostic medians for monitoring each snapshot.
-    N_total = df["tde_nuclear_preescape"] + df["tde_external_post"]
-    with np.errstate(invalid="ignore", divide="ignore"):
-        print("\n--- Remnant medians (all bound + unbound) ---")
-        print(f"  log10 Mrem_BH         = {np.nanmedian(np.log10(Mbh_Msun)):6.3f}")
-        print(f"  log10 M*_rem          = {np.nanmedian(np.log10(Mstar_Msun)):6.3f}")
-        print(f"  Re [kpc]              = {np.nanmedian(df['Re_kpc']):6.3f}")
-        print(f"  q                     = {np.nanmedian(df['q']):6.3f}")
-        print(f"  log10 Mh (FIRE-2)     = {np.nanmedian(df['log10_Mh_fire2']):6.3f}")
-        print(f"  Vesc0 [km/s]          = {np.nanmedian(df['Vesc0_kms']):7.1f}")
-        print(f"  V_cent [km/s]         = {np.nanmedian(df['v_cent_kms']):7.1f}")
-        print(f"  V_kick [km/s]         = {np.nanmedian(df['Vkick_kms']):7.1f}")
-        print(f"  V_kick / Vesc0        = {np.nanmedian(df['Vkick_over_Vesc0']):6.3f}")
-        print(f"  V_kick / V_cent       = {np.nanmedian(df['Vkick_over_Vcent']):6.3f}")
-        print(f"  TDE rate [yr^-1]      = {np.nanmedian(df['tde_rate_per_yr']):.3e}")
-        print(f"  t_leave nucleus [yr]  = {np.nanmedian(df['t_esc_yr']):.3e}")
-        print(f"  t_external [yr]       = {np.nanmedian(df['t_external_yr']):.3e}")
-        print(f"  TDEs nuclear (median) = {np.nanmedian(df['tde_nuclear_preescape']):.3f}")
-        print(f"  TDEs external (median)= {np.nanmedian(df['tde_external_post']):.3f}")
-        print(f"  TDEs total (median)   = {np.nanmedian(N_total):.3f}")
+    df["tde_rate_per_yr"] = rate_yr
+    df["t_decay_yr"] = t_decay_yr
+    df["t_esc_yr"] = t_leave
+    df["t_external_yr"] = t_external
+    df["t_return_yr"] = np.where(
+        active & is_bound & np.isfinite(t_return), t_return, np.nan
+    )
+    df["tde_nuclear_pre"] = n_nuclear_pre
+    df["tde_nuclear_post"] = n_nuclear_post
+    df["tde_nuclear_preescape"] = n_nuclear_pre + n_nuclear_post
+    df["tde_external_post"] = n_external
+    df["tde_count_per_bh"] = n_external
 
     return df
 
 
-# ===========================================================================
-# Save to Parquet
-# ===========================================================================
+# ============================================================================
+# Output
+# ============================================================================
 
-def save_parquet(df: pd.DataFrame, out_base: str, run_tag: str) -> None:
-    """
-    Save the lean set of columns needed by downstream post-processing to Parquet.
-
-    Output: simulation_results/<run_tag>/<out_base>.parquet
-    """
-    out_dir  = os.path.join(RESULTS_DIR, run_tag)
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"{out_base}.parquet")
-
-    desired_cols = [
-        "event_id", "run_id",
-        "q", "Mrem_BH_Msun", "Mstar_rem_Msun",
-        "Re_kpc", "log10_Mh_fire2",
-        "Vesc0_kms", "v_cent_kms", "Vkick_kms",
-        "Vkick_over_Vesc0", "Vkick_over_Vcent",
-        "tde_rate_per_yr", "t_esc_yr", "t_external_yr",
-        "tde_nuclear_preescape", "tde_external_post", "tde_count_per_bh",
-    ]
-    keep_cols = [c for c in desired_cols if c in df.columns]
-
-    if len(df) == 0:
-        df_save = pd.DataFrame(columns=keep_cols)
-    else:
-        df_save = df[keep_cols].copy()
-        for c in df_save.select_dtypes(include=["float64"]).columns:
-            df_save[c] = pd.to_numeric(df_save[c], downcast="float")
-        for c in df_save.select_dtypes(include=["int64"]).columns:
-            df_save[c] = pd.to_numeric(df_save[c], downcast="integer")
-
-    codec = _PARQUET_CODEC
-    if _PARQUET_ENGINE == "fastparquet":
-        codec = codec.upper()
-    df_save.to_parquet(out_path, engine=_PARQUET_ENGINE, compression=codec, index=False)
-    print(f"  Saved: {out_path}  ({len(df_save):,} rows, {_format_mb(out_path)})")
+OUTPUT_COLUMNS = [
+    # Provenance and population weighting
+    "event_id", "run_id", "z", "z_rate", "population_model_version",
+    "merger_class", "weight",
+    "descendant_bin_lo_log10M", "descendant_bin_hi_log10M",
+    "desc_bin_lo_log10M", "desc_bin_hi_log10M",
+    "bin_lo_log10M", "bin_hi_log10M",
+    # Explicit galaxy and BH pair
+    "Mstar_primary_Msun", "Mstar_secondary_Msun", "mu_star",
+    "m1_BH_Msun", "m2_BH_Msun", "q", "Mrem_BH_Msun",
+    "Mstar_rem_Msun", "Re_kpc", "log10_Mh_fire2", "Vesc0_kms",
+    # Kick and TDE results
+    "Rpeak_vcent", "v_cent_kms", "Vkick_kms",
+    "Vkick_over_Vesc0", "Vkick_over_Vcent", "escaped",
+    "tde_rate_per_yr", "t_decay_yr", "t_esc_yr", "t_external_yr",
+    "t_return_yr", "tde_nuclear_pre", "tde_nuclear_post",
+    "tde_nuclear_preescape", "tde_external_post", "tde_count_per_bh",
+]
 
 
-# ===========================================================================
+def _downcast_for_storage(df: pd.DataFrame) -> pd.DataFrame:
+    """Reduce file size while preserving exact weights and shared bin edges."""
+    out = df.copy()
+    preserve_float64 = {
+        "weight", "descendant_bin_lo_log10M", "descendant_bin_hi_log10M",
+        "desc_bin_lo_log10M", "desc_bin_hi_log10M",
+        "bin_lo_log10M", "bin_hi_log10M",
+    }
+    for column in out.select_dtypes(include=["float64"]).columns:
+        if column not in preserve_float64:
+            out[column] = pd.to_numeric(out[column], downcast="float")
+    for column in out.select_dtypes(include=["int64"]).columns:
+        out[column] = pd.to_numeric(out[column], downcast="integer")
+    return out
+
+
+def _write_parquet(df: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    codec = _PARQUET_CODEC.upper() if _PARQUET_ENGINE == "fastparquet" else _PARQUET_CODEC
+    df.to_parquet(path, engine=_PARQUET_ENGINE, compression=codec, index=False)
+
+
+def _output_path_for_source(source_path: Path) -> Path:
+    run_tag = source_path.parent.name if source_path.parent != CATALOGUE_DIR else "run00"
+    return RESULTS_DIR / run_tag / source_path.name
+
+
+def process_one_catalogue(source_path_str: str, z: float,
+                          rpeak_values: np.ndarray,
+                          rep_data: tuple[np.ndarray, ...]) -> dict:
+    """Worker: enrich one precursor catalogue and write its final Parquet."""
+    source_path = Path(source_path_str)
+    df = _read_catalogue(source_path)
+
+    if "event_id" not in df.columns:
+        df.insert(0, "event_id", np.arange(len(df), dtype=np.int64))
+    if "run_id" not in df.columns:
+        df.insert(1, "run_id", source_path.parent.name)
+
+    dt_to_z6 = float(pr.time_until_z6(z))
+    df = attach_kicks_and_tdes(df, z, dt_to_z6, rpeak_values, rep_data)
+
+    keep = [column for column in OUTPUT_COLUMNS if column in df.columns]
+    df_save = _downcast_for_storage(df[keep]) if not df.empty else pd.DataFrame(columns=keep)
+    output_path = _output_path_for_source(source_path)
+    _write_parquet(df_save, output_path)
+
+    weight = pd.to_numeric(df["weight"], errors="coerce").fillna(0.0).to_numpy(float)
+    n_ext = pd.to_numeric(df["tde_external_post"], errors="coerce").fillna(0.0).to_numpy(float)
+    classes = df["merger_class"].astype(str).str.lower().to_numpy()
+    weighted_ext = weight * np.where(np.isfinite(n_ext) & (n_ext > 0.0), n_ext, 0.0)
+
+    return {
+        "source": str(source_path),
+        "output": str(output_path),
+        "z": float(z),
+        "run": source_path.parent.name,
+        "rows": int(len(df)),
+        "weight_sum": float(np.sum(weight)),
+        "external_combined": float(np.sum(weighted_ext)),
+        "external_major": float(np.sum(weighted_ext[classes == mps.MERGER_MAJOR])),
+        "external_minor": float(np.sum(weighted_ext[classes == mps.MERGER_MINOR])),
+    }
+
+
+# ============================================================================
 # Main
-# ===========================================================================
+# ============================================================================
 
-def main():
-    """Run the final Monte Carlo simulation using peak ratios from the ratio scan."""
-    # Load peak ratios from ratio_scan_vcent.py output (must be run first)
-    rpeak_table = load_peak_ratios(f_nuc=F_NUC)
 
-    # Build the EoR snapshot list (z = 11.8 → 6.2, step = −0.2)
-    z_values = []
-    z = Z_START
-    while z >= Z_END - 1e-8:
-        z_values.append(float(f"{z:.2f}"))
-        z += DZ_SNAP
+def main() -> None:
+    """Enrich all revised ratio-scan catalogues with final kick/TDE fields."""
+    _, rpeak_values = load_peak_ratios(F_NUC)
+    z_values, paths_by_z = discover_catalogues()
 
-    # Stellar-mass bins in the range used by the ratio scan
-    all_edges    = make_mass_bin_edges()
-    active_edges = [
-        (lo, hi)
-        for lo, hi in zip(all_edges[:-1], all_edges[1:])
-        if lo >= KEEP_LOGM_MIN and hi <= KEEP_LOGM_MAX
+    print(f"[catalogues] Found {sum(len(v) for v in paths_by_z.values())} files "
+          f"across {len(z_values)} snapshots")
+    print(f"[workers] SIMULATION_WORKERS={N_WORKERS}")
+
+    print("[representative orbits] Precomputing one selected-ratio orbit per bin and snapshot...")
+    rep_by_z: dict[float, tuple[np.ndarray, ...]] = {}
+    for z in z_values:
+        rep_by_z[z] = representative_data_for_snapshot(paths_by_z[z], z, rpeak_values)
+        present = np.count_nonzero(np.isfinite(rep_by_z[z][2]))
+        print(f"  z={z:.2f}: representative bins={present}/{N_MASS}")
+
+    tasks = [
+        (str(path), float(z), rpeak_values, rep_by_z[z])
+        for z in z_values
+        for path in paths_by_z[z]
     ]
 
-    # Precompute bin metadata (BH windows, peak ratios)
-    bin_meta = build_bin_metadata(active_edges, rpeak_table)
-
-    # Precompute snapshot plan (galaxy counts, merger targets) — once for all runs
-    print("Precomputing snapshot plan...")
-    snapshot_plan = precompute_snapshot_plan(z_values, active_edges)
-
-    # Monte Carlo loop
-    for run_idx in range(N_RUNS):
-        run_tag   = f"run{run_idx:02d}"
-        seed_base = BASE_SEED + run_idx * SEED_STRIDE
-
-        print("\n" + "#" * 70)
-        print(f"### RUN {run_tag}  (seed_base = {seed_base})")
-        print("#" * 70 + "\n")
-
-        verbose = (run_idx == 0)   # print the counts table only on the first run
-
-        for snap in snapshot_plan:
-            z_cur    = snap["z"]
-            rng      = np.random.default_rng(seed_base + snap["idx"])
-            file_tag = snapshot_file_tag(z_cur)
-            out_base = f"data_{file_tag}"
-
-            if verbose:
-                print(f"\n=== [z = {z_cur:.2f}] Galaxy counts and mergers "
-                      f"(Δz = {DZ_SLICE}, full sky) ===")
-                print(f"  Merger rate R_M(z_mid = {snap['z_mid']:.2f}) = "
-                      f"{snap['R_Gyr']:.4e} Gyr^-1   "
-                      f"Δt = {snap['dt_Gyr']:.4e} Gyr")
-                print(f"\n  {'Mass bin [log10 Msun]':>24}  {'N (count)':>14}  "
-                      f"{'n [Mpc^-3]':>14}  {'Mergers':>12}")
-                print("  " + "-" * 70)
-                for lo, hi, N, n_bin, mergers_bin in snap["counts_rows"]:
-                    print(f"  [{lo:5.2f}, {hi:5.2f}]".rjust(28),
-                          f"{N:14.6e}  {n_bin:14.6e}  {mergers_bin:12.6e}")
-                total_N, total_mergers = snap["totals"]
-                print("  " + "-" * 70)
-                print(f"  {'TOTAL:':>28}  {total_N:14.6e}  {'':14}  {total_mergers:12.6e}")
-
-            # Step 1: sample merger events for this snapshot
-            df_events, bin_summary = sample_snapshot_events(
-                targets_phys=snap["targets_phys"],
-                targets_samp=snap["targets_samp"],
-                z=z_cur,
-                rng=rng,
-                bin_meta=bin_meta,
-                rpeak_table=rpeak_table,
-            )
-
-            # Stable event IDs and run label
-            if "event_id" not in df_events.columns:
-                df_events = df_events.reset_index(drop=False).rename(
-                    columns={"index": "event_id"}
+    summaries: list[dict] = []
+    if N_WORKERS == 1:
+        for args in tasks:
+            summary = process_one_catalogue(*args)
+            summaries.append(summary)
+            if PRINT_PER_FILE_SUMMARY:
+                print(
+                    f"  [{summary['run']} z={summary['z']:.2f}] "
+                    f"rows={summary['rows']:,}, "
+                    f"weighted N_ext={summary['external_combined']:.6e}"
                 )
-            df_events["run_id"] = run_tag
+    else:
+        with ProcessPoolExecutor(max_workers=N_WORKERS) as executor:
+            future_map = {
+                executor.submit(process_one_catalogue, *args): (args[0], args[1])
+                for args in tasks
+            }
+            for future in as_completed(future_map):
+                source, z = future_map[future]
+                try:
+                    summary = future.result()
+                except Exception as exc:
+                    raise RuntimeError(f"Failed while processing {source} at z={z:.2f}") from exc
+                summaries.append(summary)
+                if PRINT_PER_FILE_SUMMARY:
+                    print(
+                        f"  [{summary['run']} z={summary['z']:.2f}] "
+                        f"rows={summary['rows']:,}, "
+                        f"weighted N_ext={summary['external_combined']:.6e}"
+                    )
 
-            # Print sampling diagnostics before kick and TDE fields are attached.
-            print(f"\n=== [z = {z_cur:.2f}] Per-bin fill summary ===")
-            print(f"  {'Bin [log10 M*]':>18}  {'Target':>10}  "
-                  f"{'Sampled':>10}  {'Filled':>10}  {'Escaped':>8}")
-            for (lo, hi), info in sorted(bin_summary.items()):
-                bin_mask  = ((df_events["bin_lo_log10M"] == lo) &
-                             (df_events["bin_hi_log10M"] == hi))
-                n_escaped = int((bin_mask & df_events["escaped"]).sum())
-                print(f"  [{lo:5.2f}, {hi:5.2f}]  "
-                      f"{info['target_phys']:10d}  {info['target_samp']:10d}  "
-                      f"{info['filled']:10d}  {n_escaped:8d}")
-            print(f"\n  [{run_tag}] Total events sampled: {len(df_events):,}")
+    # A final class-sum audit catches any class-label or weighting mistakes.
+    for summary in summaries:
+        if not np.isclose(
+            summary["external_combined"],
+            summary["external_major"] + summary["external_minor"],
+            rtol=1.0e-10,
+            atol=1.0e-6,
+        ):
+            raise RuntimeError(f"Major+minor audit failed for {summary['source']}")
 
-            # Step 2: assign GW recoil kicks
-            if len(df_events):
-                df_events = assign_kicks(df_events, z_cur, rpeak_table)
-
-            # Step 3: attach TDE fields
-            df_remnants = df_events.reset_index(drop=True)
-            if len(df_remnants):
-                df_remnants = attach_tde_fields(
-                    df_remnants, z_cur, snap["dt_to_z6_yr"]
-                )
-
-            # Step 4: save snapshot to Parquet
-            save_parquet(df_remnants, out_base, run_tag)
-
-            del df_events, df_remnants
-            gc.collect()
-
-        print(f"\n### FINISHED {run_tag}\n")
+    print("\nSimulation catalogues complete.")
+    print(f"Outputs: {RESULTS_DIR}")
 
 
 if __name__ == "__main__":
