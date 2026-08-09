@@ -15,6 +15,7 @@ Contents (in order):
   7.  FIRE-2 galaxy stellar mass function (Schechter fits from gsmf_fitting.py)
   8.  Cosmology helpers (cosmic age, time to z = 6)
   9.  Duan+2025 major-merger rate
+  10. Rodriguez-Gomez+2015 stellar-mass-ratio dependence
 
 Units convention
 ----------------
@@ -48,6 +49,7 @@ __all__ = [
     "erad_fraction_ns_jf2017", "final_mass_and_fraction_ns_jf2017",
     # 2. M_BH–M_* (Reines & Volonteri 2015)
     "RV15AGNParams", "log10_mstar_from_mbh", "mstar_from_mbh",
+    "log10_mbh_from_mstar", "mbh_from_mstar",
     # 3. Galaxy size–mass–redshift (Morishita+2024)
     "M24SizeParams", "log10_re_kpc_m24", "re_kpc_m24",
     # 4. TDE building blocks
@@ -73,6 +75,9 @@ __all__ = [
     "age_of_universe_at_z", "time_until_z6",
     # 9. Merger rate (Duan+2025)
     "MergerRateFit", "merger_rate_z",
+    # 10. Relative merger mass-ratio distribution (Rodriguez-Gomez+2015)
+    "RodriguezGomezMuParams", "rodriguez_gomez_mu_exponent",
+    "powerlaw_mu_integral",
 ]
 
 
@@ -188,6 +193,34 @@ def mstar_from_mbh(m_bh: float,
                    **scatter_kwargs) -> float:
     """Return M_* [Msun] (not log10) from M_BH [Msun] using the RV15 relation."""
     return 10.0 ** log10_mstar_from_mbh(m_bh, params=params, **scatter_kwargs)
+
+
+def log10_mbh_from_mstar(mstar_msun,
+                           params: RV15AGNParams = RV15AGNParams()):
+    """Deterministic RV15 mapping from galaxy stellar mass to log10 BH mass.
+
+    Parameters
+    ----------
+    mstar_msun : float or array-like
+        Total galaxy stellar mass [Msun].
+
+    Returns
+    -------
+    float or ndarray
+        log10(M_BH / Msun).
+    """
+    mstar = np.asarray(mstar_msun, dtype=float)
+    if np.any(~np.isfinite(mstar)) or np.any(mstar <= 0.0):
+        raise ValueError("Mstar must contain positive finite values [Msun].")
+    out = params.alpha + params.beta * np.log10(mstar / params.M_pivot)
+    return float(out) if out.ndim == 0 else out
+
+
+def mbh_from_mstar(mstar_msun,
+                    params: RV15AGNParams = RV15AGNParams()):
+    """Return central BH mass [Msun] from galaxy stellar mass [Msun] using RV15."""
+    out = 10.0 ** np.asarray(log10_mbh_from_mstar(mstar_msun, params=params), dtype=float)
+    return float(out) if out.ndim == 0 else out
 
 
 # ============================================================================
@@ -746,3 +779,74 @@ def merger_rate_z(z) -> np.ndarray:
     z = np.asarray(z, dtype=float)
     p = _MERGER_RATE
     return p.f0 * np.power(1.0 + z, p.m) * np.exp(p.tau * (1.0 + z))
+
+
+# ============================================================================
+# 10. RELATIVE GALAXY MERGER MASS-RATIO DISTRIBUTION — RODRIGUEZ-GOMEZ+2015
+#     dN_merg / (dmu dt) is proportional to mu^s, with a weak dependence on
+#     primary stellar mass and redshift.  In this project the relation is
+#     extrapolated only for the relative mu distribution; Duan+2025 supplies
+#     the absolute EoR major-merger-rate normalisation.
+# ============================================================================
+
+@dataclass(frozen=True)
+class RodriguezGomezMuParams:
+    """Coefficients controlling the stellar-mass-ratio exponent."""
+    beta0: float = -1.2595
+    beta1: float = 0.0611
+    gamma: float = -0.0477
+    M_pivot: float = 1.0e10
+
+
+def rodriguez_gomez_mu_exponent(
+    mstar_msun,
+    z,
+    params: RodriguezGomezMuParams = RodriguezGomezMuParams(),
+):
+    """Return the exponent s(M*,z) in dN/dmu/dt proportional to mu**s.
+
+    Parameters
+    ----------
+    mstar_msun : float or array-like
+        Primary galaxy stellar mass [Msun].
+    z : float or array-like
+        Redshift at which the merger rate is evaluated.
+    """
+    mstar = np.asarray(mstar_msun, dtype=float)
+    redshift = np.asarray(z, dtype=float)
+    if np.any(~np.isfinite(mstar)) or np.any(mstar <= 0.0):
+        raise ValueError("mstar_msun must contain positive finite values.")
+    if np.any(~np.isfinite(redshift)) or np.any(redshift < 0.0):
+        raise ValueError("z must contain finite values >= 0.")
+
+    beta_z = params.beta0 * np.power(1.0 + redshift, params.beta1)
+    out = beta_z + params.gamma * np.log10(mstar / params.M_pivot)
+    return float(out) if np.ndim(out) == 0 else out
+
+
+def powerlaw_mu_integral(mu_lo, mu_hi, exponent):
+    """Evaluate integral(mu**s dmu) between positive mass-ratio bounds.
+
+    Invalid or empty intervals return zero.  The logarithmic s=-1 limit is
+    handled explicitly so the helper remains stable for scalar or array input.
+    """
+    lo, hi, s = np.broadcast_arrays(
+        np.asarray(mu_lo, dtype=float),
+        np.asarray(mu_hi, dtype=float),
+        np.asarray(exponent, dtype=float),
+    )
+    out = np.zeros_like(lo, dtype=float)
+    valid = (
+        np.isfinite(lo) & np.isfinite(hi) & np.isfinite(s) &
+        (lo > 0.0) & (hi > lo)
+    )
+    if np.any(valid):
+        p = s + 1.0
+        log_case = valid & (np.abs(p) < 1.0e-10)
+        regular = valid & ~log_case
+        out[log_case] = np.log(hi[log_case] / lo[log_case])
+        out[regular] = (
+            np.power(hi[regular], p[regular]) -
+            np.power(lo[regular], p[regular])
+        ) / p[regular]
+    return float(out) if out.ndim == 0 else out
