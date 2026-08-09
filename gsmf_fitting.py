@@ -14,9 +14,9 @@ Public interface
 ----------------
 get_gsmf_params()
     Returns a dict keyed by integer redshift with the three fitted
-    Schechter parameters and a flag indicating whether the shape-lock
-    was applied. Safe to call from other modules; the fit runs once
-    and the result is cached.
+    Schechter parameters, their formal 1-sigma fit uncertainties, and a flag
+    indicating whether the shape-lock was applied. Safe to call from other
+    modules; the fit runs once and the result is cached.
 
 log10_schechter(log10_M, log10_phi_star, log10_M_char, alpha)
     Evaluates log10(phi) of the per-dex Schechter function at the
@@ -163,7 +163,13 @@ def _fit_schechter_phi_only(
     """
     Fit only log10_phi_star while holding log10_M_char and alpha fixed to
     the reference shape.
-    Returns (log10_phi_star, variance).
+
+    Returns
+    -------
+    log10_phi_star : float
+        Best-fit log10 normalisation.
+    variance : float
+        Formal variance of log10_phi_star from the covariance matrix.
     """
     def _schechter_fixed_shape(log10_M: np.ndarray, log10_phi_star: float) -> np.ndarray:
         return log10_schechter(log10_M, log10_phi_star, fixed_log10_M_char, fixed_alpha)
@@ -177,6 +183,19 @@ def _fit_schechter_phi_only(
         maxfev=20_000,
     )
     return float(popt[0]), float(pcov[0, 0])
+
+
+def _formal_errors_from_covariance(pcov: np.ndarray) -> np.ndarray:
+    """
+    Return formal 1-sigma parameter uncertainties from a covariance matrix.
+
+    Negative diagonal entries should not occur for a well-behaved covariance
+    matrix, but the guard avoids invalid square roots if a numerical issue
+    appears.
+    """
+    diag = np.diag(np.asarray(pcov, dtype=float))
+    diag = np.where(diag >= 0.0, diag, np.nan)
+    return np.sqrt(diag)
 
 
 # ---------------------------------------------------------------------------
@@ -196,10 +215,22 @@ def get_gsmf_params() -> Dict[int, Dict]:
     Returns
     -------
     dict keyed by integer redshift, each entry containing:
-        log10_phi_star : float  -- log10 normalisation [Mpc^-3 dex^-1]
-        log10_M_char   : float  -- log10 characteristic mass [M_sun]
-        alpha          : float  -- low-mass slope
-        shape_locked   : bool   -- True if shape was fixed to z = 10 values
+        log10_phi_star       : float       -- log10 normalisation [Mpc^-3 dex^-1]
+        log10_M_char         : float       -- log10 characteristic mass [M_sun]
+        alpha                : float       -- low-mass slope
+        sigma_log10_phi_star : float       -- formal 1-sigma fit uncertainty
+        sigma_log10_M_char   : float|None  -- formal 1-sigma fit uncertainty,
+                                             None when fixed
+        sigma_alpha          : float|None  -- formal 1-sigma fit uncertainty,
+                                             None when fixed
+        shape_locked         : bool        -- True if shape was fixed to z = 10 values
+
+    Notes
+    -----
+    The reported uncertainties are formal least-squares uncertainties from
+    sqrt(diag(pcov)) returned by scipy.optimize.curve_fit. They do not include
+    systematic uncertainties in the FIRE-2 GSMF, the choice of Schechter
+    functional form, or the z >= 11 shape-lock assumption.
     """
     global _cached_params
     if _cached_params is not None:
@@ -209,11 +240,19 @@ def get_gsmf_params() -> Dict[int, Dict]:
 
     # Step 1: fit all redshifts with all three Schechter parameters free.
     for z, d in _FIRE2_DATA.items():
-        popt, _ = _fit_schechter_free(d["log10_M"], d["log10_phi"])
+        popt, pcov = _fit_schechter_free(d["log10_M"], d["log10_phi"])
+        perr = _formal_errors_from_covariance(pcov)
+
         params[z] = {
             "log10_phi_star": float(popt[0]),
             "log10_M_char":   float(popt[1]),
             "alpha":          float(popt[2]),
+
+            # Formal 1-sigma fit uncertainties from the covariance matrix.
+            "sigma_log10_phi_star": float(perr[0]),
+            "sigma_log10_M_char":   float(perr[1]),
+            "sigma_alpha":          float(perr[2]),
+
             "shape_locked":   False,
         }
 
@@ -221,15 +260,27 @@ def get_gsmf_params() -> Dict[int, Dict]:
     ref = params[_SHAPE_LOCK_REF_Z]
     for z in _SHAPE_LOCK_ZS:
         d = _FIRE2_DATA[z]
-        log10_phi_star, _ = _fit_schechter_phi_only(
+        log10_phi_star, var_log10_phi_star = _fit_schechter_phi_only(
             d["log10_M"], d["log10_phi"],
             fixed_log10_M_char=ref["log10_M_char"],
             fixed_alpha=ref["alpha"],
         )
+
+        if var_log10_phi_star >= 0.0:
+            sigma_log10_phi_star = float(np.sqrt(var_log10_phi_star))
+        else:
+            sigma_log10_phi_star = float("nan")
+
         params[z] = {
             "log10_phi_star": log10_phi_star,
             "log10_M_char":   ref["log10_M_char"],
             "alpha":          ref["alpha"],
+
+            # Only phi_star was fitted here. M_char and alpha were fixed to z = 10.
+            "sigma_log10_phi_star": sigma_log10_phi_star,
+            "sigma_log10_M_char":   None,
+            "sigma_alpha":          None,
+
             "shape_locked":   True,
         }
 
@@ -241,18 +292,34 @@ def get_gsmf_params() -> Dict[int, Dict]:
 # Printing
 # ---------------------------------------------------------------------------
 
+def _fmt_pm(value: float, sigma: float | None, ndigits: int = 3) -> str:
+    """Format a fitted value with its formal uncertainty, or mark it as fixed."""
+    if sigma is None:
+        return f"{value:.{ndigits}f} (fixed)"
+    return f"{value:.{ndigits}f} ± {sigma:.{ndigits}f}"
+
+
 def print_gsmf_params() -> None:
     """Print the fitted Schechter parameters for all redshifts."""
     params = get_gsmf_params()
+
+    print("Formal 1-sigma uncertainties are from sqrt(diag(pcov)) returned by scipy.optimize.curve_fit.")
+    print("For z = 11 and z = 12, log10(M_char) and alpha were fixed to the z = 10 values.")
+    print()
+
     for z in sorted(params):
         p    = params[z]
         flag = "  [shape locked to z=10]" if p["shape_locked"] else ""
+
         print(f"z = {z}{flag}")
-        print(f"  log10(phi_star) = {p['log10_phi_star']:.3f}"
+        print("  log10(phi_star) = "
+              f"{_fmt_pm(p['log10_phi_star'], p['sigma_log10_phi_star'])}"
               f"   (phi_star = {10**p['log10_phi_star']:.3e} Mpc^-3 dex^-1)")
-        print(f"  log10(M_char)   = {p['log10_M_char']:.3f}"
+        print("  log10(M_char)   = "
+              f"{_fmt_pm(p['log10_M_char'], p['sigma_log10_M_char'])}"
               f"   (M_char   = {10**p['log10_M_char']:.3e} M_sun)")
-        print(f"  alpha           = {p['alpha']:.3f}")
+        print("  alpha           = "
+              f"{_fmt_pm(p['alpha'], p['sigma_alpha'])}")
         print("-" * 60)
 
 
